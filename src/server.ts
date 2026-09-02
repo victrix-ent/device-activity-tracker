@@ -25,7 +25,7 @@ const SIGNAL_API_URL = process.env.SIGNAL_API_URL || 'http://localhost:8080';
 const app = express();
 app.use(cors());
 app.use(basicAuth({
-    users: { 'admin': 'MYENVISPUBLIC' }, // 👈 Change your password here
+    users: { 'admin': process.env.DASHBOARD_PASSWORD || 'fallback_temporary_password' }, 
     challenge: true,
     realm: 'Activity Tracker'
 }));
