@@ -7,7 +7,11 @@ import { Dashboard } from './components/Dashboard';
 const API_URL = 'https://at-b3fr.onrender.com';
 
 
-export const socket: Socket = io(API_URL, { autoConnect: false });
+export const socket: Socket = io(API_URL, { 
+    transports: ['websocket', 'polling'], 
+    autoConnect: true 
+});
+
 
 export type Platform = 'whatsapp' | 'signal';
 
