@@ -4,7 +4,8 @@ import { Login } from './components/Login';
 import { Dashboard } from './components/Dashboard';
 
 // Create socket with autoConnect disabled so we can add listeners before connecting
-const API_URL = 'https://onrender.com';
+const API_URL = 'https://at-b3fr.onrender.com';
+
 
 export const socket: Socket = io(API_URL, { autoConnect: false });
 
