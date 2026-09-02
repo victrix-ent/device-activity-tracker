@@ -33,8 +33,10 @@ const io = new Server(httpServer, {
     cors: {
         origin: "*", // Allow all origins for dev
         methods: ["GET", "POST"]
-    }
+    },
+    transports: ['websocket', 'polling'] // 👈 Add this line to fix Render connection routing
 });
+
 
 let sock: any;
 let isWhatsAppConnected = false;
