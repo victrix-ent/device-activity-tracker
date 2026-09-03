@@ -1,7 +1,5 @@
-
 import {
     AuthenticationState,
-    AuthenticationCreds,
     SignalDataSet,
     SignalDataTypeMap,
     SignalKeyStore,
@@ -9,6 +7,7 @@ import {
     BufferJSON,
     makeCacheableSignalKeyStore,
 } from '@whiskeysockets/baileys';
+
 import { Pool } from 'pg';
 import { pino } from 'pino';
 
@@ -32,6 +31,16 @@ export async function createDatabaseAuthState(
         )
     `);
 
+    /*
+     * Store Baileys values as JSON strings.
+     *
+     * This is important because Baileys uses BufferJSON
+     * to represent Buffers and Uint8Arrays.
+     *
+     * PostgreSQL receives a normal JSON string and the
+     * value is reconstructed with BufferJSON.reviver.
+     */
+
     async function read(
         keyType: string,
         keyId: string
@@ -52,14 +61,23 @@ export async function createDatabaseAuthState(
             ]
         );
 
-        if (!result.rows.length) {
+        if (result.rows.length === 0) {
             return null;
         }
 
+        const raw = result.rows[0].value;
+
+        if (raw === null || raw === undefined) {
+            return null;
+        }
+
+        /*
+         * PostgreSQL JSONB is already parsed into an object.
+         * Re-serialize it using BufferJSON.replacer so that
+         * Buffers are reconstructed correctly.
+         */
         return JSON.parse(
-            JSON.stringify(
-                result.rows[0].value
-            ),
+            JSON.stringify(raw),
             BufferJSON.reviver
         );
     }
@@ -68,9 +86,12 @@ export async function createDatabaseAuthState(
         keyType: string,
         keyId: string,
         value: any
-    ) {
+    ): Promise<void> {
 
-        if (value === null || value === undefined) {
+        if (
+            value === null ||
+            value === undefined
+        ) {
 
             await pool.query(
                 `
@@ -89,14 +110,23 @@ export async function createDatabaseAuthState(
             return;
         }
 
-        const serialized =
-            JSON.parse(
-                JSON.stringify(
-                    value,
-                    BufferJSON.replacer
-                )
-            );
+        /*
+         * Convert the Baileys value into a plain JSON-compatible
+         * object using BufferJSON.
+         */
+        const serialized = JSON.stringify(
+            value,
+            BufferJSON.replacer
+        );
 
+        /*
+         * Send the JSON string directly to PostgreSQL.
+         *
+         * PostgreSQL parses it as JSONB. This avoids the
+         * previous double JSON.parse/stringify conversion
+         * that could produce malformed JSON for some Baileys
+         * key structures.
+         */
         await pool.query(
             `
             INSERT INTO baileys_auth (
@@ -105,7 +135,7 @@ export async function createDatabaseAuthState(
                 key_id,
                 value
             )
-            VALUES ($1, $2, $3, $4)
+            VALUES ($1, $2, $3, $4::jsonb)
             ON CONFLICT (
                 session_id,
                 key_type,
@@ -123,11 +153,16 @@ export async function createDatabaseAuthState(
         );
     }
 
-    const storedCreds =
-        await read(
-            'creds',
-            'creds'
-        );
+    /*
+     * Load existing credentials.
+     *
+     * If there are no credentials yet, Baileys starts a
+     * completely new authentication session.
+     */
+    const storedCreds = await read(
+        'creds',
+        'creds'
+    );
 
     const creds =
         storedCreds ||
@@ -158,10 +193,10 @@ export async function createDatabaseAuthState(
                             );
 
                         if (
-                            value !== null
+                            value !== null &&
+                            value !== undefined
                         ) {
-                            result[id] =
-                                value;
+                            result[id] = value;
                         }
                     }
                 )
@@ -186,7 +221,9 @@ export async function createDatabaseAuthState(
                         type as keyof SignalDataSet
                     ];
 
-                if (!values) continue;
+                if (!values) {
+                    continue;
+                }
 
                 for (
                     const id of Object.keys(values)
@@ -224,6 +261,7 @@ export async function createDatabaseAuthState(
 
     const state: AuthenticationState = {
         creds,
+
         keys:
             makeCacheableSignalKeyStore(
                 keys,
@@ -231,7 +269,7 @@ export async function createDatabaseAuthState(
             )
     };
 
-    const saveCreds = async () => {
+    const saveCreds = async (): Promise<void> => {
 
         await write(
             'creds',
