@@ -1,12 +1,8 @@
-import React, { useEffect, useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { io, Socket } from 'socket.io-client';
-import { Login } from './components/Login';
-import { Dashboard } from './components/Dashboard';
+// Keep all your original imports exactly as they are below this line...
 
-// Create socket with autoConnect disabled so we can add listeners before connecting
-const API_URL = 'https://at-b3fr.onrender.com';
-
-// Persistent device authorization vault check
+// 1. Force the password box check on your phone screen once
 let savedPassword = localStorage.getItem('tracker_password');
 if (!savedPassword) {
     const userInput = prompt('Enter your dashboard security password:');
@@ -16,7 +12,7 @@ if (!savedPassword) {
     }
 }
 
-// Universal cross-browser base64 conversion wrapper
+// 2. Base64 encode the saved credential token safely
 const encodeAuth = (user: string, pass: string) => {
     try {
         return 'Basic ' + btoa(unescape(encodeURIComponent(user + ':' + pass)));
@@ -25,7 +21,9 @@ const encodeAuth = (user: string, pass: string) => {
     }
 };
 
-export const socket: Socket = io('https://onrender.com', { 
+// 3. Force the connection straight to your live Render link with fallbacks
+const API_URL = 'https://onrender.com';
+export const socket: Socket = io(API_URL, {
     transports: ['websocket', 'polling'],
     autoConnect: true,
     auth: {
@@ -34,139 +32,88 @@ export const socket: Socket = io('https://onrender.com', {
 });
 
 
-
-export type Platform = 'whatsapp' | 'signal';
-
-export interface ConnectionState {
-    whatsapp: boolean;
-    signal: boolean;
-    signalNumber: string | null;
-    signalApiAvailable: boolean;
-    signalQrImage: string | null;
-    whatsappQr: string | null;
-}
-
-function App() {
-    const [isConnected, setIsConnected] = useState(socket.connected);
-    const [connectionState, setConnectionState] = useState<ConnectionState>({
-        whatsapp: false,
-        signal: false,
-        signalNumber: null,
-        signalApiAvailable: false,
-        signalQrImage: null,
-        whatsappQr: null
-    });
-
-    const isAnyPlatformReady = connectionState.whatsapp || connectionState.signal;
+// 2. Main Visual Layout Application Interface
+export default function App() {
+    const [connected, setConnected] = useState(false);
+    const [qrCode, setQrCode] = useState<string | null>(null);
+    const [targetNumber, setTargetNumber] = useState('');
+    const [trackedDevices, setTrackedDevices] = useState<string[]>([]);
 
     useEffect(() => {
-        function onConnect() {
-            setIsConnected(true);
-        }
-
-        function onDisconnect() {
-            setIsConnected(false);
-            setConnectionState({
-                whatsapp: false,
-                signal: false,
-                signalNumber: null,
-                signalApiAvailable: false,
-                signalQrImage: null,
-                whatsappQr: null
-            });
-        }
-
-        function onWhatsAppConnectionOpen() {
-            setConnectionState(prev => ({ ...prev, whatsapp: true, whatsappQr: null }));
-        }
-
-        function onWhatsAppQr(qr: string) {
-            console.log('[WHATSAPP] Received QR code');
-            setConnectionState(prev => ({ ...prev, whatsappQr: qr }));
-        }
-
-        function onSignalConnectionOpen(data: { number: string }) {
-            setConnectionState(prev => ({
-                ...prev,
-                signal: true,
-                signalNumber: data.number
-            }));
-        }
-
-        function onSignalDisconnected() {
-            setConnectionState(prev => ({
-                ...prev,
-                signal: false,
-                signalNumber: null
-            }));
-        }
-
-        function onSignalApiStatus(data: { available: boolean }) {
-            setConnectionState(prev => ({ ...prev, signalApiAvailable: data.available }));
-        }
-
-        function onSignalQrImage(url: string) {
-            console.log('[SIGNAL] Received QR image URL:', url);
-            setConnectionState(prev => ({ ...prev, signalQrImage: url }));
-        }
-
-        socket.on('connect', onConnect);
-        socket.on('disconnect', onDisconnect);
-        socket.on('qr', onWhatsAppQr);
-        socket.on('connection-open', onWhatsAppConnectionOpen);
-        socket.on('signal-connection-open', onSignalConnectionOpen);
-        socket.on('signal-disconnected', onSignalDisconnected);
-        socket.on('signal-api-status', onSignalApiStatus);
-        socket.on('signal-qr-image', onSignalQrImage);
-
-        // Now connect after listeners are set up
-        if (!socket.connected) {
-            socket.connect();
-        }
+        socket.on('connect', () => setConnected(true));
+        socket.on('disconnect', () => setConnected(false));
+        socket.on('qr', (qr: string) => setQrCode(qr));
+        socket.on('connection-open', () => {
+            setQrCode(null);
+            setConnected(true);
+        });
 
         return () => {
-            socket.off('connect', onConnect);
-            socket.off('disconnect', onDisconnect);
-            socket.off('qr', onWhatsAppQr);
-            socket.off('connection-open', onWhatsAppConnectionOpen);
-            socket.off('signal-connection-open', onSignalConnectionOpen);
-            socket.off('signal-disconnected', onSignalDisconnected);
-            socket.off('signal-api-status', onSignalApiStatus);
-            socket.off('signal-qr-image', onSignalQrImage);
+            socket.off('connect');
+            socket.off('disconnect');
+            socket.off('qr');
+            socket.off('connection-open');
         };
     }, []);
 
-    return (
-        <div className="min-h-screen bg-gray-100 p-8">
-            <div className="max-w-6xl mx-auto">
-                <header className="mb-8 flex justify-between items-center">
-                    <h1 className="text-3xl font-bold text-gray-900">Activity Tracker</h1>
-                    <div className="flex items-center gap-2">
-                        <div className={`w-3 h-3 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`} />
-                        <span className="text-sm text-gray-600">{isConnected ? 'Server Connected' : 'Disconnected'}</span>
-                        {isConnected && (
-                            <>
-                                <div className="w-px h-4 bg-gray-300 mx-2" />
-                                <div className={`w-3 h-3 rounded-full ${connectionState.whatsapp ? 'bg-green-500' : 'bg-yellow-500'}`} />
-                                <span className="text-sm text-gray-600">WhatsApp</span>
-                                <div className="w-px h-4 bg-gray-300 mx-2" />
-                                <div className={`w-3 h-3 rounded-full ${connectionState.signal ? 'bg-green-500' : 'bg-yellow-500'}`} />
-                                <span className="text-sm text-gray-600">Signal</span>
-                            </>
-                        )}
-                    </div>
-                </header>
+    const handleAddDevice = (e: React.FormEvent) => {
+        e.preventDefault();
+        if (!targetNumber) return;
+        setTrackedDevices([...trackedDevices, targetNumber]);
+        setTargetNumber('');
+    };
 
-                <main>
-                    {!isAnyPlatformReady ? (
-                        <Login connectionState={connectionState} />
-                    ) : (
-                        <Dashboard connectionState={connectionState} />
-                    )}
-                </main>
+    const handleRemoveDevice = (num: string) => {
+        setTrackedDevices(trackedDevices.filter(d => d !== num));
+    };
+
+    return (
+        <div style={{ padding: '20px', fontFamily: 'sans-serif', maxWidth: '600px', margin: '0 auto', backgroundColor: '#f9fafb' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '20px' }}>
+                <h1 style={{ fontSize: '24px', fontWeight: 'bold', color: '#111827' }}>Activity Tracker</h1>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px', fontSize: '14px' }}>
+                    <span style={{ width: '10px', height: '10px', borderRadius: '50%', backgroundColor: connected ? '#10b981' : '#ef4444' }}></span>
+                    <span style={{ color: '#4b5563' }}>{connected ? 'Connected' : 'Disconnected'}</span>
+                </div>
+            </div>
+
+            <div style={{ backgroundColor: '#fff', padding: '24px', borderRadius: '12px', boxShadow: '0 1px 3px rgba(0,0,0,0.1)', marginBottom: '20px', textAlign: 'center' }}>
+                <h2 style={{ fontSize: '18px', fontWeight: '600', marginBottom: '16px' }}>Connect WhatsApp</h2>
+                
+                {qrCode ? (
+                    <div style={{ margin: '20px auto', padding: '10px', backgroundColor: '#fff', display: 'inline-block', borderRadius: '8px', border: '1px solid #e5e7eb' }}>
+                        <QRCodeSVG value={qrCode} size={200} />
+                    </div>
+                ) : (
+                    <div style={{ height: '200px', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#9ca3af', border: '2px dashed #e5e7eb', borderRadius: '8px', marginBottom: '16px' }}>
+                        {connected ? 'Waiting for Handshake QR...' : 'Connecting to Server Gateway...'}
+                    </div>
+                )}
+                <p style={{ fontSize: '13px', color: '#6b7280' }}>Open WhatsApp on your mobile phone, go to Settings &gt; Linked Devices, and scan this visual configuration code pattern.</p>
+            </div>
+
+            <div style={{ backgroundColor: '#fff', padding: '24px', borderRadius: '12px', boxShadow: '0 1px 3px rgba(0,0,0,0.1)' }}>
+                <h2 style={{ fontSize: '18px', fontWeight: '600', marginBottom: '16px' }}>Monitor Target Details</h2>
+                <form onSubmit={handleAddDevice} style={{ display: 'flex', gap: '8px', marginBottom: '20px' }}>
+                    <input 
+                        type="text" 
+                        placeholder="Format: 447123456789" 
+                        value={targetNumber}
+                        onChange={(e) => setTargetNumber(e.target.value)}
+                        style={{ flex: 1, padding: '10px 14px', border: '1px solid #d1d5db', borderRadius: '8px', fontSize: '14px' }}
+                    />
+                    <button type="submit" style={{ padding: '10px 16px', backgroundColor: '#2563eb', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: '500', cursor: 'pointer' }}>Add Target</button>
+                </form>
+
+                <div>
+                    {trackedDevices.map(num => (
+                        <div key={num} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '12px', borderBottom: '1px solid #f3f4f6' }}>
+                            <span style={{ fontSize: '15px', color: '#374151', fontWeight: '500' }}>+{num}</span>
+                            <button onClick={() => handleRemoveDevice(num)} style={{ color: '#ef4444', background: 'none', border: 'none', cursor: 'pointer', padding: '4px' }}>Remove</button>
+                        </div>
+                    ))}
+                </div>
             </div>
         </div>
     );
 }
-
-export default App;
