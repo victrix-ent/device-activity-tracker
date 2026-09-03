@@ -1,5 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { io, Socket } from 'socket.io-client';
+import { Login } from './components/Login';
+import { Dashboard } from './components/Dashboard';
 // Keep all your original imports exactly as they are below this line...
 
 // 1. Force the password box check on your phone screen once
