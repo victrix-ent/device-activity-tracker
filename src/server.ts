@@ -615,13 +615,19 @@ async function restoreSignalTrackers() {
 // ============================================================
 
 async function connectToWhatsApp() {
+    if (!pool) {
+        throw new Error(
+            'DATABASE_URL is required for WhatsApp session persistence'
+        );
+    }
+    
     const {
         state,
         saveCreds
-    } =
-        await useMultiFileAuthState(
-            'auth_info_baileys'
-        );
+    } = await createDatabaseAuthState(
+        pool,
+        'whatsapp-main'
+    );
 
     sock =
         makeWASocket({
