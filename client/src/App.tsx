@@ -32,15 +32,6 @@ export const socket: Socket = io(API_URL, {
 });
 
 
-export const socket: Socket = io('https://onrender.com', { 
-    transports: ['websocket', 'polling'],
-    autoConnect: true,
-    auth: {
-        token: encodeAuth('admin', savedPassword || '')
-    }
-});
-
-
 
 export type Platform = 'whatsapp' | 'signal';
 
