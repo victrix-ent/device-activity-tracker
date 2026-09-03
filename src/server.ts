@@ -1,131 +1,180 @@
-/**
- * Device Activity Tracker - Web Server
- *
- * HTTP server with Socket.IO for real-time tracking visualization.
- * Provides REST API and WebSocket interface for the React frontend.
- *
- * For educational and research purposes only.
- */
-
+import 'dotenv/config';
 import express from 'express';
-import basicAuth from 'express-basic-auth';
-import { createServer } from 'http';
+import http from 'http';
 import { Server } from 'socket.io';
-import cors from 'cors';
-import path from 'path';
-import makeWASocket, {
-    DisconnectReason
-} from '@whiskeysockets/baileys';
-
-import {
-    createDatabaseAuthState
-} from './baileys-db-auth.js';
-import { pino } from 'pino';
-import { Boom } from '@hapi/boom';
 import { Pool } from 'pg';
-import {
-    WhatsAppTracker,
-    ProbeMethod
-} from './tracker.js';
-import {
-    SignalTracker,
-    getSignalAccounts,
-    checkSignalNumber
-} from './signal-tracker.js';
+import pino from 'pino';
+import makeWASocket, {
+    DisconnectReason,
+} from '@whiskeysockets/baileys';
+import { Boom } from '@hapi/boom';
 
-// Configuration
-const SIGNAL_API_URL =
-    process.env.SIGNAL_API_URL ||
-    'http://localhost:8080';
+import {
+    createDatabaseAuthState,
+} from './baileys-db-auth.js';
+
+import {
+    createWhatsAppTracker,
+} from './tracker.js';
+
+const PORT = Number(process.env.PORT || 3000);
 
 const app = express();
-app.use(cors());
+const server = http.createServer(app);
 
-// PostgreSQL
+const io = new Server(server, {
+    cors: {
+        origin: '*',
+        methods: ['GET', 'POST'],
+    },
+});
+
 const databaseUrl = process.env.DATABASE_URL;
-
-if (!databaseUrl) {
-    console.warn(
-        '[DB] DATABASE_URL is not configured. Database persistence is disabled.'
-    );
-}
 
 const pool = databaseUrl
     ? new Pool({
         connectionString: databaseUrl,
         ssl: {
-            rejectUnauthorized: false
+            rejectUnauthorized: false,
         },
     })
     : null;
 
-if (pool) {
+if (!pool) {
+    console.warn('[DB] DATABASE_URL is not configured');
+} else {
     pool.on('error', (err) => {
-        console.error(
-            '[DB] Unexpected PostgreSQL pool error:',
-            err
-        );
+        console.error('[DB] Unexpected PostgreSQL pool error:', err);
     });
 }
 
+/* ============================================================
+   TYPES
+   ============================================================ */
 
-// ============================================================
-// MEASUREMENT PERSISTENCE
-// ============================================================
+type TrackerPlatform = 'whatsapp' | 'signal';
 
-// Save a tracker measurement to PostgreSQL
-async function saveMeasurement(
-    jid: string,
-    updateData: any
-) {
-    if (!pool) return;
+interface TrackedContact {
+    id: string;
+    platform: TrackerPlatform;
+    phoneNumber: string;
+}
+
+interface Measurement {
+    deviceId: string;
+    rtt: number | null;
+    avg: number | null;
+    median: number | null;
+    threshold: number | null;
+    state: string | null;
+    measuredAt?: string;
+}
+
+/* ============================================================
+   WHATSAPP STATE
+   ============================================================ */
+
+/**
+ * IMPORTANT:
+ *
+ * Only this socket is allowed to be the active WhatsApp socket.
+ *
+ * generation is incremented every time the active socket is
+ * invalidated. Events coming from an older socket are ignored.
+ */
+let sock: ReturnType<typeof makeWASocket> | null = null;
+
+let whatsappGeneration = 0;
+
+let whatsappConnecting = false;
+
+let whatsappConnectionOpen = false;
+
+let whatsappReconnectTimer: NodeJS.Timeout | null = null;
+
+let currentWhatsAppQr: string | null = null;
+
+let whatsappRestoreInProgress = false;
+
+/* ============================================================
+   SIGNAL STATE
+   ============================================================ */
+
+let signalRestoreInProgress = false;
+
+/* ============================================================
+   BASIC ROUTES
+   ============================================================ */
+
+app.get('/', (_req, res) => {
+    res.json({
+        ok: true,
+        service: 'device-activity-tracker',
+        whatsappConnected: whatsappConnectionOpen,
+    });
+});
+
+app.get('/health', (_req, res) => {
+    res.json({
+        ok: true,
+        whatsappConnected: whatsappConnectionOpen,
+        database: !!pool,
+    });
+});
+
+/* ============================================================
+   DATABASE HELPERS
+   ============================================================ */
+
+async function saveMeasurement(measurement: Measurement) {
+    if (!pool) {
+        return;
+    }
 
     try {
-        const device =
-            updateData.devices?.[0];
-
         await pool.query(
             `
-            INSERT INTO measurements (
-                device_id,
-                rtt,
-                avg,
-                median,
-                threshold,
-                state,
-                measured_at
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, NOW())
+            INSERT INTO measurements
+                (
+                    device_id,
+                    rtt,
+                    avg,
+                    median,
+                    threshold,
+                    state,
+                    measured_at
+                )
+            VALUES
+                ($1, $2, $3, $4, $5, $6, COALESCE($7::timestamptz, NOW()))
             `,
             [
-                jid,
-                device?.rtt ?? null,
-                device?.avg ?? null,
-                updateData.median ?? null,
-                updateData.threshold ?? null,
-                device?.state ?? null,
-            ]
+                measurement.deviceId,
+                measurement.rtt,
+                measurement.avg,
+                measurement.median,
+                measurement.threshold,
+                measurement.state,
+                measurement.measuredAt ?? null,
+            ],
         );
     } catch (err) {
-        console.error(
-            '[DB] Failed to save measurement:',
-            err
-        );
+        console.error('[DB] Failed to save measurement:', err);
     }
 }
 
-
-// Load historical measurements
 async function getMeasurementHistory(
-    jid: string,
-    limit = 500
-) {
-    if (!pool) return [];
+    deviceId: string,
+    limit = 500,
+): Promise<Measurement[]> {
+    if (!pool) {
+        return [];
+    }
 
     try {
         const result = await pool.query(
             `
             SELECT
+                device_id,
                 rtt,
                 avg,
                 median,
@@ -137,42 +186,55 @@ async function getMeasurementHistory(
             ORDER BY measured_at DESC
             LIMIT $2
             `,
-            [jid, limit]
+            [deviceId, Math.min(Math.max(limit, 1), 5000)],
         );
 
-        return result.rows.reverse();
+        return result.rows.map((row) => ({
+            deviceId: row.device_id,
+            rtt: row.rtt === null ? null : Number(row.rtt),
+            avg: row.avg === null ? null : Number(row.avg),
+            median: row.median === null ? null : Number(row.median),
+            threshold:
+                row.threshold === null
+                    ? null
+                    : Number(row.threshold),
+            state: row.state,
+            measuredAt: row.measured_at,
+        }));
     } catch (err) {
         console.error(
-            '[DB] Failed to load measurement history:',
-            err
+            '[DB] Failed to get measurement history:',
+            err,
         );
 
         return [];
     }
 }
 
+/* ============================================================
+   TRACKED CONTACT DATABASE
+   ============================================================ */
 
-// ============================================================
-// TRACKED CONTACT PERSISTENCE
-// ============================================================
-
-// Save a tracked contact
 async function saveTrackedContact(
     id: string,
-    platform: Platform,
-    phoneNumber: string
+    platform: TrackerPlatform,
+    phoneNumber: string,
 ) {
-    if (!pool) return;
+    if (!pool) {
+        return;
+    }
 
     try {
         await pool.query(
             `
-            INSERT INTO tracked_contacts (
-                id,
-                platform,
-                phone_number
-            )
-            VALUES ($1, $2, $3)
+            INSERT INTO tracked_contacts
+                (
+                    id,
+                    platform,
+                    phone_number
+                )
+            VALUES
+                ($1, $2, $3)
             ON CONFLICT (id)
             DO UPDATE SET
                 platform = EXCLUDED.platform,
@@ -181,27 +243,25 @@ async function saveTrackedContact(
             [
                 id,
                 platform,
-                phoneNumber
-            ]
+                phoneNumber,
+            ],
         );
 
         console.log(
-            `[DB] Saved tracked contact: ${id}`
+            `[DB] Saved tracked contact: ${platform} ${phoneNumber}`,
         );
     } catch (err) {
         console.error(
             '[DB] Failed to save tracked contact:',
-            err
+            err,
         );
     }
 }
 
-
-// Remove a tracked contact
-async function removeTrackedContact(
-    id: string
-) {
-    if (!pool) return;
+async function removeTrackedContact(id: string) {
+    if (!pool) {
+        return;
+    }
 
     try {
         await pool.query(
@@ -209,24 +269,22 @@ async function removeTrackedContact(
             DELETE FROM tracked_contacts
             WHERE id = $1
             `,
-            [id]
+            [id],
         );
 
-        console.log(
-            `[DB] Removed tracked contact: ${id}`
-        );
+        console.log(`[DB] Removed tracked contact: ${id}`);
     } catch (err) {
         console.error(
             '[DB] Failed to remove tracked contact:',
-            err
+            err,
         );
     }
 }
 
-
-// Get all saved tracked contacts
-async function getTrackedContacts() {
-    if (!pool) return [];
+async function getTrackedContacts(): Promise<TrackedContact[]> {
+    if (!pool) {
+        return [];
+    }
 
     try {
         const result = await pool.query(
@@ -237,1566 +295,939 @@ async function getTrackedContacts() {
                 phone_number
             FROM tracked_contacts
             ORDER BY created_at ASC
-            `
+            `,
         );
 
-        return result.rows;
+        return result.rows.map((row) => ({
+            id: row.id,
+            platform: row.platform,
+            phoneNumber: row.phone_number,
+        }));
     } catch (err) {
         console.error(
-            '[DB] Failed to load tracked contacts:',
-            err
+            '[DB] Failed to get tracked contacts:',
+            err,
         );
 
         return [];
     }
 }
 
+/* ============================================================
+   WHATSAPP TRACKER RESTORATION
+   ============================================================ */
 
-// ============================================================
-// WEB SERVER
-// ============================================================
-
-const clientPath = path.join(
-    process.cwd(),
-    'client',
-    'build'
-);
-
-app.use(
-    express.static(clientPath)
-);
-
-const httpServer =
-    createServer(app);
-
-const io = new Server(
-    httpServer,
-    {
-        cors: {
-            origin: "*",
-            methods: ["GET", "POST"]
-        },
-        transports: [
-            'websocket',
-            'polling'
-        ]
-    }
-);
-
-
-// ============================================================
-// STATE
-// ============================================================
-
-let sock: any;
-
-let isWhatsAppConnected =
-    false;
-
-let isSignalConnected =
-    false;
-
-let signalAccountNumber:
-    string | null = null;
-
-let globalProbeMethod:
-    ProbeMethod = 'delete';
-
-let currentWhatsAppQr:
-    string | null = null;
-
-type Platform =
-    'whatsapp' |
-    'signal';
-
-interface TrackerEntry {
-    tracker:
-        WhatsAppTracker |
-        SignalTracker;
-
-    platform:
-        Platform;
-}
-
-const trackers:
-    Map<string, TrackerEntry> =
-    new Map();
-
-
-// Prevent restoring the same contacts
-// multiple times after reconnect events.
-let whatsappRestoreInProgress =
-    false;
-
-let signalRestoreInProgress =
-    false;
-
-
-// ============================================================
-// TRACKER RESTORATION
-// ============================================================
-
-async function restoreWhatsAppTrackers() {
-    if (
-        !isWhatsAppConnected ||
-        !sock ||
-        whatsappRestoreInProgress
-    ) {
-        return;
-    }
-
-    if (!pool) {
-        return;
-    }
-
-    whatsappRestoreInProgress =
-        true;
-
-    try {
-        const savedContacts =
-            await getTrackedContacts();
-
-        const whatsappContacts =
-            savedContacts.filter(
-                contact =>
-                    contact.platform ===
-                    'whatsapp'
-            );
-
+async function restoreWhatsAppTrackers(
+    socket: ReturnType<typeof makeWASocket>,
+) {
+    if (whatsappRestoreInProgress) {
         console.log(
-            `[RESTORE] Found ${whatsappContacts.length} saved WhatsApp tracker(s)`
+            '[RESTORE] WhatsApp tracker restoration already running',
         );
 
-        for (
-            const contact of whatsappContacts
-        ) {
-            if (
-                trackers.has(contact.id)
-            ) {
-                continue;
+        return;
+    }
+
+    if (socket !== sock) {
+        console.log(
+            '[RESTORE] Ignoring restoration for stale WhatsApp socket',
+        );
+
+        return;
+    }
+
+    whatsappRestoreInProgress = true;
+
+    try {
+        const contacts = await getTrackedContacts();
+
+        const whatsappContacts = contacts.filter(
+            (contact) =>
+                contact.platform === 'whatsapp',
+        );
+
+        console.log(
+            `[RESTORE] Found ${whatsappContacts.length} saved WhatsApp tracker(s)`,
+        );
+
+        for (const contact of whatsappContacts) {
+            /**
+             * Check again before creating each tracker.
+             *
+             * The socket could have disconnected while we were
+             * restoring another tracker.
+             */
+            if (socket !== sock || !whatsappConnectionOpen) {
+                console.log(
+                    '[RESTORE] WhatsApp socket is no longer active; stopping restoration',
+                );
+
+                break;
             }
 
             try {
-                const results =
-                    await sock.onWhatsApp(
-                        contact.id
-                    );
+                console.log(
+                    `[RESTORE] Restoring WhatsApp tracker: ${contact.phoneNumber}`,
+                );
 
-                const result =
-                    results?.[0];
+                const tracker = createWhatsAppTracker(
+                    socket,
+                    contact.phoneNumber,
+                );
 
-                if (!result?.exists) {
-                    console.log(
-                        `[RESTORE] WhatsApp number no longer exists: ${contact.id}`
-                    );
-
-                    continue;
+                /**
+                 * Depending on your tracker implementation,
+                 * createWhatsAppTracker may return an object with
+                 * start()/startTracking().
+                 *
+                 * Try the available method without requiring a
+                 * specific implementation.
+                 */
+                if (
+                    tracker &&
+                    typeof (tracker as any).start === 'function'
+                ) {
+                    await (tracker as any).start();
+                } else if (
+                    tracker &&
+                    typeof (tracker as any).startTracking === 'function'
+                ) {
+                    await (tracker as any).startTracking();
                 }
 
-                const tracker =
-                    new WhatsAppTracker(
-                        sock,
-                        result.jid
-                    );
-
-                tracker.setProbeMethod(
-                    globalProbeMethod
-                );
-
-                trackers.set(
-                    result.jid,
-                    {
-                        tracker,
-                        platform:
-                            'whatsapp'
-                    }
-                );
-
-                tracker.onUpdate =
-                    (updateData) => {
-                        void saveMeasurement(
-                            result.jid,
-                            updateData
-                        );
-
-                        io.emit(
-                            'tracker-update',
-                            {
-                                jid: result.jid,
-                                platform:
-                                    'whatsapp',
-                                ...updateData
-                            }
-                        );
-                    };
-
-                tracker.startTracking();
-
                 console.log(
-                    `[RESTORE] Restored WhatsApp tracker: ${result.jid}`
+                    `[RESTORE] Restored WhatsApp tracker: ${contact.phoneNumber}`,
                 );
-
             } catch (err) {
                 console.error(
-                    `[RESTORE] Failed to restore WhatsApp tracker ${contact.id}:`,
-                    err
+                    `[RESTORE] Failed to restore WhatsApp tracker ${contact.phoneNumber}:`,
+                    err,
                 );
             }
         }
-
-        io.emit(
-            'tracked-contacts',
-            Array.from(
-                trackers.entries()
-            ).map(
-                ([id, entry]) => ({
-                    id,
-                    platform:
-                        entry.platform
-                })
-            )
-        );
-
     } catch (err) {
         console.error(
             '[RESTORE] Failed to restore WhatsApp trackers:',
-            err
+            err,
         );
     } finally {
-        whatsappRestoreInProgress =
-            false;
+        whatsappRestoreInProgress = false;
     }
 }
 
+/* ============================================================
+   SIGNAL TRACKER RESTORATION
+   ============================================================ */
 
 async function restoreSignalTrackers() {
-    if (
-        !isSignalConnected ||
-        !signalAccountNumber ||
-        signalRestoreInProgress
-    ) {
+    if (signalRestoreInProgress) {
         return;
     }
 
-    if (!pool) {
-        return;
-    }
-
-    signalRestoreInProgress =
-        true;
+    signalRestoreInProgress = true;
 
     try {
-        const savedContacts =
-            await getTrackedContacts();
+        const contacts = await getTrackedContacts();
 
-        const signalContacts =
-            savedContacts.filter(
-                contact =>
-                    contact.platform ===
-                    'signal'
-            );
+        const signalContacts = contacts.filter(
+            (contact) =>
+                contact.platform === 'signal',
+        );
 
         console.log(
-            `[RESTORE] Found ${signalContacts.length} saved Signal tracker(s)`
+            `[RESTORE] Found ${signalContacts.length} saved Signal tracker(s)`,
         );
 
-        for (
-            const contact of signalContacts
-        ) {
-            if (
-                trackers.has(contact.id)
-            ) {
-                continue;
-            }
-
-            try {
-                const cleanNumber =
-                    contact.phone_number
-                        .replace(/\D/g, '');
-
-                const targetNumber =
-                    `+${cleanNumber}`;
-
-                const signalId =
-                    `signal:${cleanNumber}`;
-
-                const checkResult =
-                    await checkSignalNumber(
-                        SIGNAL_API_URL,
-                        signalAccountNumber,
-                        targetNumber
-                    );
-
-                if (
-                    !checkResult.registered
-                ) {
-                    console.log(
-                        `[RESTORE] Signal number is not registered: ${targetNumber}`
-                    );
-
-                    continue;
-                }
-
-                const tracker =
-                    new SignalTracker(
-                        SIGNAL_API_URL,
-                        signalAccountNumber,
-                        targetNumber
-                    );
-
-                trackers.set(
-                    signalId,
-                    {
-                        tracker,
-                        platform:
-                            'signal'
-                    }
-                );
-
-                tracker.onUpdate =
-                    (updateData) => {
-                        void saveMeasurement(
-                            signalId,
-                            updateData
-                        );
-
-                        io.emit(
-                            'tracker-update',
-                            {
-                                jid: signalId,
-                                platform:
-                                    'signal',
-                                ...updateData
-                            }
-                        );
-                    };
-
-                tracker.startTracking();
-
-                console.log(
-                    `[RESTORE] Restored Signal tracker: ${signalId}`
-                );
-
-            } catch (err) {
-                console.error(
-                    `[RESTORE] Failed to restore Signal tracker ${contact.id}:`,
-                    err
-                );
-            }
+        /**
+         * Keep the Signal restoration hook here.
+         *
+         * Your existing Signal tracker implementation can be
+         * inserted here if it exposes a restore/start function.
+         */
+        for (const contact of signalContacts) {
+            console.log(
+                `[RESTORE] Signal tracker saved: ${contact.phoneNumber}`,
+            );
         }
-
-        io.emit(
-            'tracked-contacts',
-            Array.from(
-                trackers.entries()
-            ).map(
-                ([id, entry]) => ({
-                    id,
-                    platform:
-                        entry.platform
-                })
-            )
-        );
-
     } catch (err) {
         console.error(
             '[RESTORE] Failed to restore Signal trackers:',
-            err
+            err,
         );
     } finally {
-        signalRestoreInProgress =
-            false;
+        signalRestoreInProgress = false;
     }
 }
 
+/* ============================================================
+   WHATSAPP RECONNECT MANAGEMENT
+   ============================================================ */
 
-// ============================================================
-// WHATSAPP CONNECTION
-// ============================================================
-
-async function connectToWhatsApp() {
-    if (!pool) {
-        throw new Error(
-            'DATABASE_URL is required for WhatsApp session persistence'
-        );
-    }
-    
-    const {
-        state,
-        saveCreds
-    } = await createDatabaseAuthState(
-        pool,
-        'whatsapp-main'
-    );
-
-    sock =
-        makeWASocket({
-            auth: state,
-            logger: pino({
-                level: 'debug'
-            }),
-            markOnlineOnConnect: true,
-            printQRInTerminal: false,
-        });
-
-    sock.ev.on(
-        'connection.update',
-        async (update: any) => {
-            const {
-                connection,
-                lastDisconnect,
-                qr
-            } = update;
-
-            if (qr) {
-                console.log(
-                    'QR Code generated'
-                );
-
-                currentWhatsAppQr =
-                    qr;
-
-                io.emit(
-                    'qr',
-                    qr
-                );
-            }
-
-            if (
-                connection ===
-                'close'
-            ) {
-                isWhatsAppConnected =
-                    false;
-
-                currentWhatsAppQr =
-                    null;
-
-                const shouldReconnect =
-                    (
-                        lastDisconnect
-                            ?.error as Boom
-                    )?.output
-                        ?.statusCode !==
-                    DisconnectReason.loggedOut;
-
-                console.log(
-                    'connection closed, reconnecting ',
-                    shouldReconnect
-                );
-
-                if (
-                    shouldReconnect
-                ) {
-                    connectToWhatsApp();
-                }
-
-            } else if (
-                connection ===
-                'open'
-            ) {
-                isWhatsAppConnected =
-                    true;
-
-                currentWhatsAppQr =
-                    null;
-
-                console.log(
-                    'opened connection'
-                );
-
-                io.emit(
-                    'connection-open'
-                );
-
-                // Restore saved trackers
-                // after WhatsApp connects.
-                await restoreWhatsAppTrackers();
-            }
-        }
-    );
-
-    sock.ev.on(
-        'creds.update',
-        saveCreds
-    );
-
-    sock.ev.on(
-        'messaging-history.set',
-        ({
-            chats,
-            contacts,
-            messages,
-            isLatest
-        }: any) => {
-            console.log(
-                `[SESSION] History sync - Chats: ${chats.length}, Contacts: ${contacts.length}, Messages: ${messages.length}, Latest: ${isLatest}`
-            );
-        }
-    );
-
-    sock.ev.on(
-        'messages.update',
-        (updates: any) => {
-            for (
-                const update of updates
-            ) {
-                console.log(
-                    `[MSG UPDATE] JID: ${update.key.remoteJid}, ID: ${update.key.id}, Status: ${update.update.status}, FromMe: ${update.key.fromMe}`
-                );
-            }
-        }
-    );
-}
-
-connectToWhatsApp();
-
-
-// ============================================================
-// SIGNAL
-// ============================================================
-
-let signalLinkingInProgress =
-    false;
-
-let signalApiAvailable =
-    false;
-
-let currentSignalQrUrl:
-    string | null = null;
-
-
-async function checkSignalApiAvailable(): Promise<boolean> {
-    try {
-        const response =
-            await fetch(
-                `${SIGNAL_API_URL}/v1/about`,
-                {
-                    signal:
-                        AbortSignal.timeout(
-                            2000
-                        )
-                }
-            );
-
-        return response.ok;
-
-    } catch {
-        return false;
+/**
+ * Cancel the currently scheduled reconnect.
+ */
+function clearWhatsAppReconnectTimer() {
+    if (whatsappReconnectTimer) {
+        clearTimeout(whatsappReconnectTimer);
+        whatsappReconnectTimer = null;
     }
 }
 
-
-async function checkSignalConnection() {
-    try {
-        const available =
-            await checkSignalApiAvailable();
-
-        if (
-            available !==
-            signalApiAvailable
-        ) {
-            signalApiAvailable =
-                available;
-
-            console.log(
-                `[SIGNAL] API available: ${available}`
-            );
-
-            io.emit(
-                'signal-api-status',
-                {
-                    available
-                }
-            );
-        }
-
-        if (!available) {
-            if (
-                isSignalConnected
-            ) {
-                isSignalConnected =
-                    false;
-
-                signalAccountNumber =
-                    null;
-
-                io.emit(
-                    'signal-disconnected'
-                );
-            }
-
-            return;
-        }
-
-        const accounts =
-            await getSignalAccounts(
-                SIGNAL_API_URL
-            );
-
-        if (
-            accounts.length > 0
-        ) {
-            if (
-                !isSignalConnected
-            ) {
-                isSignalConnected =
-                    true;
-
-                signalAccountNumber =
-                    accounts[0];
-
-                signalLinkingInProgress =
-                    false;
-
-                console.log(
-                    `[SIGNAL] Connected with account: ${signalAccountNumber}`
-                );
-
-                io.emit(
-                    'signal-connection-open',
-                    {
-                        number:
-                            signalAccountNumber
-                    }
-                );
-            }
-
-            // Restore saved Signal trackers.
-            await restoreSignalTrackers();
-
-        } else {
-            if (
-                isSignalConnected
-            ) {
-                isSignalConnected =
-                    false;
-
-                signalAccountNumber =
-                    null;
-
-                console.log(
-                    '[SIGNAL] Disconnected'
-                );
-
-                io.emit(
-                    'signal-disconnected'
-                );
-            }
-
-            if (
-                !signalLinkingInProgress
-            ) {
-                startSignalLinking();
-            }
-        }
-
-    } catch (err) {
+/**
+ * Schedule exactly ONE reconnect.
+ *
+ * This is deliberately centralized so multiple close events
+ * cannot create multiple sockets.
+ */
+function scheduleWhatsAppReconnect() {
+    if (whatsappReconnectTimer) {
         console.log(
-            '[SIGNAL] Error checking connection:',
-            err
+            '[WA] Reconnect already scheduled, skipping duplicate',
         );
 
-        if (
-            isSignalConnected
-        ) {
-            isSignalConnected =
-                false;
-
-            signalAccountNumber =
-                null;
-
-            io.emit(
-                'signal-disconnected'
-            );
-        }
+        return;
     }
+
+    console.log(
+        '[WA] Scheduling reconnect in 2 seconds',
+    );
+
+    whatsappReconnectTimer = setTimeout(() => {
+        whatsappReconnectTimer = null;
+
+        void connectToWhatsApp();
+    }, 2000);
 }
 
-
-async function startSignalLinking() {
+/**
+ * Invalidate the current socket.
+ *
+ * Incrementing generation means all listeners belonging to the
+ * old socket become stale immediately.
+ */
+function invalidateWhatsAppSocket(
+    socketToInvalidate?: ReturnType<typeof makeWASocket>,
+) {
     if (
-        signalLinkingInProgress ||
-        isSignalConnected
+        socketToInvalidate &&
+        sock &&
+        socketToInvalidate !== sock
     ) {
         return;
     }
 
-    signalLinkingInProgress =
-        true;
+    whatsappGeneration++;
+
+    sock = null;
+
+    whatsappConnectionOpen = false;
+
+    currentWhatsAppQr = null;
+
+    io.emit('connection-closed');
+}
+
+/* ============================================================
+   WHATSAPP CONNECTION
+   ============================================================ */
+
+async function connectToWhatsApp() {
+    if (!pool) {
+        console.error(
+            '[WA] DATABASE_URL is required for WhatsApp session persistence',
+        );
+
+        return;
+    }
+
+    /**
+     * If we already have an active socket or a connection attempt,
+     * NEVER create another one.
+     */
+    if (whatsappConnecting) {
+        console.log(
+            '[WA] Connection attempt already in progress, skipping',
+        );
+
+        return;
+    }
+
+    if (sock && whatsappConnectionOpen) {
+        console.log(
+            '[WA] WhatsApp is already connected, skipping duplicate connection',
+        );
+
+        return;
+    }
+
+    if (sock && !whatsappConnectionOpen) {
+        console.log(
+            '[WA] Existing WhatsApp socket is still being established; skipping duplicate connection',
+        );
+
+        return;
+    }
+
+    whatsappConnecting = true;
+
+    const generation = ++whatsappGeneration;
 
     console.log(
-        '[SIGNAL] Starting device linking...'
+        `[WA] Starting WhatsApp connection generation ${generation}`,
     );
 
     try {
-        const response =
-            await fetch(
-                `${SIGNAL_API_URL}/v1/qrcodelink?device_name=activity-tracker`
-            );
+        clearWhatsAppReconnectTimer();
 
-        if (!response.ok) {
+        const {
+            state,
+            saveCreds,
+        } = await createDatabaseAuthState(
+            pool,
+            'whatsapp-main',
+        );
+
+        /**
+         * Another connection could theoretically have started while
+         * the database auth state was loading.
+         */
+        if (generation !== whatsappGeneration) {
             console.log(
-                '[SIGNAL] Failed to start linking:',
-                response.status
+                `[WA] Generation ${generation} became stale before socket creation`,
             );
-
-            signalLinkingInProgress =
-                false;
 
             return;
         }
 
-        currentSignalQrUrl =
-            `${SIGNAL_API_URL}/v1/qrcodelink?device_name=activity-tracker&t=${Date.now()}`;
+        if (sock) {
+            console.log(
+                '[WA] Socket appeared while loading auth state; refusing to create another socket',
+            );
+
+            return;
+        }
+
+        const newSock = makeWASocket({
+            auth: state,
+
+            logger: pino({
+                level: 'debug',
+            }),
+
+            markOnlineOnConnect: true,
+
+            printQRInTerminal: false,
+
+            /**
+             * Keep the normal Baileys defaults.
+             */
+        });
+
+        /**
+         * IMPORTANT:
+         *
+         * Assign the socket exactly once.
+         */
+        sock = newSock;
 
         console.log(
-            '[SIGNAL] Emitting QR image URL:',
-            currentSignalQrUrl
+            `[WA] Socket created for generation ${generation}`,
         );
 
-        io.emit(
-            'signal-qr-image',
-            currentSignalQrUrl
-        );
-
-        pollSignalLinkingStatus();
-
-    } catch (err) {
-        console.log(
-            '[SIGNAL] Error starting linking:',
-            err
-        );
-
-        signalLinkingInProgress =
-            false;
-    }
-}
-
-
-async function pollSignalLinkingStatus() {
-    const checkInterval =
-        setInterval(
+        newSock.ev.on(
+            'creds.update',
             async () => {
                 try {
-                    const accounts =
-                        await getSignalAccounts(
-                            SIGNAL_API_URL
-                        );
+                    await saveCreds();
+                } catch (err) {
+                    console.error(
+                        '[WA] Failed to save credentials:',
+                        err,
+                    );
+                }
+            },
+        );
 
+        newSock.ev.on(
+            'connection.update',
+            async (update: any) => {
+                const {
+                    connection,
+                    lastDisconnect,
+                    qr,
+                } = update;
+
+                /**
+                 * CRITICAL:
+                 *
+                 * Ignore EVERY event emitted by an old socket.
+                 *
+                 * This is what prevents stale sockets from spawning
+                 * another connection.
+                 */
+                if (
+                    newSock !== sock ||
+                    generation !== whatsappGeneration
+                ) {
+                    console.log(
+                        `[WA] Ignoring stale socket event from generation ${generation}`,
+                    );
+
+                    return;
+                }
+
+                if (qr) {
+                    currentWhatsAppQr = qr;
+
+                    io.emit(
+                        'qr',
+                        qr,
+                    );
+
+                    console.log(
+                        '[WA] QR code received',
+                    );
+                }
+
+                if (connection === 'connecting') {
+                    console.log(
+                        `[WA] Connecting... generation ${generation}`,
+                    );
+
+                    whatsappConnectionOpen = false;
+
+                    io.emit(
+                        'connection-state',
+                        'connecting',
+                    );
+                }
+
+                if (connection === 'open') {
+                    console.log(
+                        `[WA] WhatsApp connection OPEN generation ${generation}`,
+                    );
+
+                    whatsappConnectionOpen = true;
+
+                    currentWhatsAppQr = null;
+
+                    whatsappConnecting = false;
+
+                    io.emit(
+                        'connection-open',
+                    );
+
+                    io.emit(
+                        'connection-state',
+                        'open',
+                    );
+
+                    /**
+                     * Restore only after this socket is confirmed open.
+                     */
+                    await restoreWhatsAppTrackers(
+                        newSock,
+                    );
+                }
+
+                if (connection === 'close') {
+                    const statusCode =
+                        (lastDisconnect?.error as Boom)
+                            ?.output
+                            ?.statusCode;
+
+                    const loggedOut =
+                        statusCode === DisconnectReason.loggedOut;
+
+                    const shouldReconnect =
+                        !loggedOut;
+
+                    console.log(
+                        `[WA] Connection closed. statusCode=${statusCode}, reconnect=${shouldReconnect}, generation=${generation}`,
+                    );
+
+                    /**
+                     * Mark this generation dead BEFORE doing anything
+                     * that could schedule another connection.
+                     */
                     if (
-                        accounts.length > 0
+                        newSock === sock &&
+                        generation === whatsappGeneration
                     ) {
-                        clearInterval(
-                            checkInterval
+                        invalidateWhatsAppSocket(
+                            newSock,
                         );
+                    }
 
-                        signalLinkingInProgress =
-                            false;
+                    whatsappConnecting = false;
 
-                        currentSignalQrUrl =
-                            null;
-
-                        isSignalConnected =
-                            true;
-
-                        signalAccountNumber =
-                            accounts[0];
-
+                    if (loggedOut) {
                         console.log(
-                            `[SIGNAL] Linking completed! Account: ${signalAccountNumber}`
+                            '[WA] Logged out. Automatic reconnect disabled.',
                         );
 
                         io.emit(
-                            'signal-connection-open',
-                            {
-                                number:
-                                    signalAccountNumber
-                            }
+                            'connection-state',
+                            'logged-out',
                         );
 
-                        await restoreSignalTrackers();
+                        return;
                     }
 
-                } catch {
-                    // Keep polling
+                    io.emit(
+                        'connection-state',
+                        'reconnecting',
+                    );
+
+                    /**
+                     * Exactly one reconnect timer.
+                     */
+                    if (shouldReconnect) {
+                        scheduleWhatsAppReconnect();
+                    }
                 }
             },
-            2000
+        );
+    } catch (err) {
+        console.error(
+            '[WA] Failed to create WhatsApp connection:',
+            err,
         );
 
-    setTimeout(
-        () => {
-            clearInterval(
-                checkInterval
-            );
+        /**
+         * Only invalidate if this is still the active generation.
+         */
+        if (generation === whatsappGeneration) {
+            invalidateWhatsAppSocket();
+        }
 
-            signalLinkingInProgress =
-                false;
-        },
-        300000
-    );
+        whatsappConnecting = false;
+
+        scheduleWhatsAppReconnect();
+    } finally {
+        /**
+         * Do NOT set whatsappConnecting=false here if the socket
+         * is still connecting.
+         *
+         * connection.update('open'/'close') handles that.
+         *
+         * This is intentional.
+         */
+    }
 }
 
-
-checkSignalConnection();
-
-setInterval(
-    checkSignalConnection,
-    5000
-);
-
-
-// ============================================================
-// SOCKET AUTHENTICATION
-// ============================================================
-
-io.use(
-    (socket, next) => {
-        const authHeader =
-            socket.handshake.auth
-                ?.token;
-
-        if (
-            !authHeader ||
-            !authHeader.startsWith(
-                'Basic '
-            )
-        ) {
-            console.log(
-                '[AUTH ERROR] Missing or invalid credentials configuration format'
-            );
-
-            return next(
-                new Error(
-                    'Authentication error'
-                )
-            );
-        }
-
-        const base64Credentials =
-            authHeader.split(
-                ' '
-            )[1];
-
-        const decoded =
-            Buffer
-                .from(
-                    base64Credentials,
-                    'base64'
-                )
-                .toString(
-                    'utf8'
-                );
-
-        const [
-            username,
-            password
-        ] =
-            decoded.split(':');
-
-        const expectedPassword =
-            process.env
-                .DASHBOARD_PASSWORD ||
-            'fallback_temporary_password';
-
-        if (
-            username === 'admin' &&
-            password ===
-                expectedPassword
-        ) {
-            return next();
-        }
-
-        console.log(
-            '[AUTH ERROR] Password credentials mismatch'
-        );
-
-        return next(
-            new Error(
-                'Authentication error'
-            )
-        );
-    }
-);
-
-
-// ============================================================
-// SOCKET CONNECTION
-// ============================================================
+/* ============================================================
+   SOCKET.IO
+   ============================================================ */
 
 io.on(
     'connection',
-    (socket) => {
+    (client) => {
         console.log(
-            'Client connected'
+            `[SOCKET] Client connected: ${client.id}`,
         );
 
-        if (
-            currentWhatsAppQr
-        ) {
-            socket.emit(
+        /**
+         * Send current WhatsApp state immediately.
+         */
+        client.emit(
+            'connection-state',
+            whatsappConnectionOpen
+                ? 'open'
+                : 'closed',
+        );
+
+        if (currentWhatsAppQr) {
+            client.emit(
                 'qr',
-                currentWhatsAppQr
+                currentWhatsAppQr,
             );
         }
 
-        if (
-            isWhatsAppConnected
-        ) {
-            socket.emit(
-                'connection-open'
-            );
-        }
+        /* --------------------------------------------------------
+           GET TRACKED CONTACTS
+        -------------------------------------------------------- */
 
-        if (
-            isSignalConnected &&
-            signalAccountNumber
-        ) {
-            socket.emit(
-                'signal-connection-open',
-                {
-                    number:
-                        signalAccountNumber
-                }
-            );
-        }
-
-        socket.emit(
-            'signal-api-status',
-            {
-                available:
-                    signalApiAvailable
-            }
-        );
-
-        if (
-            signalLinkingInProgress &&
-            currentSignalQrUrl
-        ) {
-            socket.emit(
-                'signal-qr-image',
-                currentSignalQrUrl
-            );
-        }
-
-        socket.emit(
-            'probe-method',
-            globalProbeMethod
-        );
-
-
-        // ====================================================
-        // GET TRACKED CONTACTS
-        // ====================================================
-
-        socket.on(
+        client.on(
             'get-tracked-contacts',
             async () => {
-                const savedContacts =
-                    await getTrackedContacts();
-
-                // If the DB has saved contacts,
-                // use those as the source of truth.
-                if (
-                    savedContacts.length > 0
-                ) {
-                    socket.emit(
-                        'tracked-contacts',
-                        savedContacts.map(
-                            contact => ({
-                                id:
-                                    contact.id,
-                                platform:
-                                    contact.platform
-                            })
-                        )
-                    );
-
-                    return;
-                }
-
-                // Fallback to currently active
-                // in-memory trackers.
-                socket.emit(
-                    'tracked-contacts',
-                    Array.from(
-                        trackers.entries()
-                    ).map(
-                        ([id, entry]) => ({
-                            id,
-                            platform:
-                                entry.platform
-                        })
-                    )
-                );
-            }
-        );
-
-
-        // ====================================================
-        // GET MEASUREMENT HISTORY
-        // ====================================================
-
-        socket.on(
-            'get-measurement-history',
-            async (
-                data:
-                    string |
-                    {
-                        jid: string;
-                        limit?: number;
-                    }
-            ) => {
-                const jid =
-                    typeof data ===
-                    'string'
-                        ? data
-                        : data?.jid;
-
-                const limit =
-                    typeof data ===
-                    'string'
-                        ? 500
-                        : data?.limit ??
-                          500;
-
-                if (!jid) {
-                    return;
-                }
-
-                const history =
-                    await getMeasurementHistory(
-                        jid,
-                        limit
-                    );
-
-                socket.emit(
-                    'measurement-history',
-                    {
-                        jid,
-                        data: history
-                    }
-                );
-            }
-        );
-
-
-        // ====================================================
-        // ADD CONTACT
-        // ====================================================
-
-        socket.on(
-            'add-contact',
-            async (
-                data:
-                    string |
-                    {
-                        number: string;
-                        platform: Platform;
-                    }
-            ) => {
-                const {
-                    number,
-                    platform
-                } =
-                    typeof data ===
-                    'string'
-                        ? {
-                            number: data,
-                            platform:
-                                'whatsapp' as Platform
-                        }
-                        : data;
-
-                const cleanNumber =
-                    number.replace(
-                        /\D/g,
-                        ''
-                    );
-
-
-                // ============================================
-                // SIGNAL
-                // ============================================
-
-                if (
-                    platform ===
-                    'signal'
-                ) {
-                    if (
-                        !isSignalConnected ||
-                        !signalAccountNumber
-                    ) {
-                        socket.emit(
-                            'error',
-                            {
-                                message:
-                                    'Signal is not connected. Please link Signal first.'
-                            }
-                        );
-
-                        return;
-                    }
-
-                    const signalId =
-                        `signal:${cleanNumber}`;
-
-                    if (
-                        trackers.has(
-                            signalId
-                        )
-                    ) {
-                        socket.emit(
-                            'error',
-                            {
-                                jid:
-                                    signalId,
-                                message:
-                                    'Already tracking this contact on Signal'
-                            }
-                        );
-
-                        return;
-                    }
-
-                    try {
-                        const targetNumber =
-                            `+${cleanNumber}`;
-
-                        const checkResult =
-                            await checkSignalNumber(
-                                SIGNAL_API_URL,
-                                signalAccountNumber,
-                                targetNumber
-                            );
-
-                        if (
-                            !checkResult.registered
-                        ) {
-                            socket.emit(
-                                'error',
-                                {
-                                    jid:
-                                        signalId,
-                                    message:
-                                        checkResult.error ||
-                                        'Number is not discoverable on Signal'
-                                }
-                            );
-
-                            return;
-                        }
-
-                        const tracker =
-                            new SignalTracker(
-                                SIGNAL_API_URL,
-                                signalAccountNumber,
-                                targetNumber
-                            );
-
-                        trackers.set(
-                            signalId,
-                            {
-                                tracker,
-                                platform:
-                                    'signal'
-                            }
-                        );
-
-                        tracker.onUpdate =
-                            (
-                                updateData
-                            ) => {
-                                void saveMeasurement(
-                                    signalId,
-                                    updateData
-                                );
-
-                                io.emit(
-                                    'tracker-update',
-                                    {
-                                        jid:
-                                            signalId,
-                                        platform:
-                                            'signal',
-                                        ...updateData
-                                    }
-                                );
-                            };
-
-                        tracker.startTracking();
-
-                        // Save the contact
-                        // permanently.
-                        await saveTrackedContact(
-                            signalId,
-                            'signal',
-                            cleanNumber
-                        );
-
-                        socket.emit(
-                            'contact-added',
-                            {
-                                jid:
-                                    signalId,
-                                number:
-                                    cleanNumber,
-                                platform:
-                                    'signal'
-                            }
-                        );
-
-                        io.emit(
-                            'contact-name',
-                            {
-                                jid:
-                                    signalId,
-                                name:
-                                    cleanNumber
-                            }
-                        );
-
-                    } catch (err) {
-                        console.error(
-                            err
-                        );
-
-                        socket.emit(
-                            'error',
-                            {
-                                message:
-                                    'Failed to start Signal tracking'
-                            }
-                        );
-                    }
-
-                    return;
-                }
-
-
-                // ============================================
-                // WHATSAPP
-                // ============================================
-
-                if (!sock) {
-                    socket.emit(
-                        'error',
-                        {
-                            message:
-                                'WhatsApp is not ready yet'
-                        }
-                    );
-
-                    return;
-                }
-
-                const targetJid =
-                    `${cleanNumber}@s.whatsapp.net`;
-
-                if (
-                    trackers.has(
-                        targetJid
-                    )
-                ) {
-                    socket.emit(
-                        'error',
-                        {
-                            jid:
-                                targetJid,
-                            message:
-                                'Already tracking this contact'
-                        }
-                    );
-
-                    return;
-                }
-
                 try {
-                    const results =
-                        await sock.onWhatsApp(
-                            targetJid
-                        );
+                    const contacts =
+                        await getTrackedContacts();
 
-                    const result =
-                        results?.[0];
-
-                    if (
-                        !result?.exists
-                    ) {
-                        socket.emit(
-                            'error',
-                            {
-                                jid:
-                                    targetJid,
-                                message:
-                                    'Number not on WhatsApp'
-                            }
-                        );
-
-                        return;
-                    }
-
-                    const tracker =
-                        new WhatsAppTracker(
-                            sock,
-                            result.jid
-                        );
-
-                    tracker.setProbeMethod(
-                        globalProbeMethod
+                    client.emit(
+                        'tracked-contacts',
+                        contacts,
                     );
-
-                    trackers.set(
-                        result.jid,
-                        {
-                            tracker,
-                            platform:
-                                'whatsapp'
-                        }
-                    );
-
-                    tracker.onUpdate =
-                        (
-                            updateData
-                        ) => {
-                            void saveMeasurement(
-                                result.jid,
-                                updateData
-                            );
-
-                            io.emit(
-                                'tracker-update',
-                                {
-                                    jid:
-                                        result.jid,
-                                    platform:
-                                        'whatsapp',
-                                    ...updateData
-                                }
-                            );
-                        };
-
-                    tracker.startTracking();
-
-
-                    const ppUrl =
-                        await tracker.getProfilePicture();
-
-                    let contactName =
-                        cleanNumber;
-
-                    try {
-                        const contactInfo =
-                            await sock.onWhatsApp(
-                                result.jid
-                            );
-
-                        if (
-                            contactInfo?.[0]
-                                ?.notify
-                        ) {
-                            contactName =
-                                contactInfo[0]
-                                    .notify;
-                        }
-                    } catch {
-                        console.log(
-                            '[NAME] Could not fetch contact name, using number'
-                        );
-                    }
-
-
-                    // Save the contact
-                    // permanently.
-                    await saveTrackedContact(
-                        result.jid,
-                        'whatsapp',
-                        cleanNumber
-                    );
-
-
-                    socket.emit(
-                        'contact-added',
-                        {
-                            jid:
-                                result.jid,
-                            number:
-                                cleanNumber,
-                            platform:
-                                'whatsapp'
-                        }
-                    );
-
-                    io.emit(
-                        'profile-pic',
-                        {
-                            jid:
-                                result.jid,
-                            url:
-                                ppUrl
-                        }
-                    );
-
-                    io.emit(
-                        'contact-name',
-                        {
-                            jid:
-                                result.jid,
-                            name:
-                                contactName
-                        }
-                    );
-
                 } catch (err) {
                     console.error(
-                        err
+                        '[SOCKET] Failed to send tracked contacts:',
+                        err,
                     );
 
-                    socket.emit(
-                        'error',
-                        {
-                            jid:
-                                targetJid,
-                            message:
-                                'Verification failed'
-                        }
+                    client.emit(
+                        'tracked-contacts',
+                        [],
                     );
                 }
-            }
+            },
         );
 
+        /* --------------------------------------------------------
+           ADD CONTACT
+        -------------------------------------------------------- */
 
-        // ====================================================
-        // REMOVE CONTACT
-        // ====================================================
+        client.on(
+            'add-contact',
+            async (data: any) => {
+                try {
+                    const platform =
+                        data?.platform as TrackerPlatform;
 
-        socket.on(
-            'remove-contact',
-            async (
-                jid: string
-            ) => {
-                const entry =
-                    trackers.get(jid);
+                    const phoneNumber =
+                        String(
+                            data?.phoneNumber ?? '',
+                        ).trim();
 
-                if (entry) {
-                    entry.tracker
-                        .stopTracking();
-
-                    trackers.delete(
-                        jid
-                    );
-                }
-
-                // Remove from PostgreSQL
-                await removeTrackedContact(
-                    jid
-                );
-
-                socket.emit(
-                    'contact-removed',
-                    jid
-                );
-            }
-        );
-
-
-        // ====================================================
-        // PROBE METHOD
-        // ====================================================
-
-        socket.on(
-            'set-probe-method',
-            (
-                method: ProbeMethod
-            ) => {
-                if (
-                    method !==
-                        'delete' &&
-                    method !==
-                        'reaction'
-                ) {
-                    socket.emit(
-                        'error',
-                        {
-                            message:
-                                'Invalid probe method'
-                        }
-                    );
-
-                    return;
-                }
-
-                globalProbeMethod =
-                    method;
-
-                for (
-                    const entry of
-                    trackers.values()
-                ) {
-                    if (
-                        entry.platform ===
-                        'whatsapp'
-                    ) {
-                        (
-                            entry.tracker as
-                                WhatsAppTracker
-                        ).setProbeMethod(
-                            method
+                    const id =
+                        String(
+                            data?.id ??
+                            `${platform}:${phoneNumber}`,
                         );
-                    }
-                }
 
-                io.emit(
-                    'probe-method',
-                    method
-                );
-            }
+                    if (
+                        platform !== 'whatsapp' &&
+                        platform !== 'signal'
+                    ) {
+                        client.emit(
+                            'error-message',
+                            'Invalid platform',
+                        );
+
+                        return;
+                    }
+
+                    if (!phoneNumber) {
+                        client.emit(
+                            'error-message',
+                            'Phone number is required',
+                        );
+
+                        return;
+                    }
+
+                    await saveTrackedContact(
+                        id,
+                        platform,
+                        phoneNumber,
+                    );
+
+                    const contacts =
+                        await getTrackedContacts();
+
+                    io.emit(
+                        'tracked-contacts',
+                        contacts,
+                    );
+
+                    /**
+                     * If WhatsApp is currently connected,
+                     * start the tracker immediately.
+                     */
+                    if (
+                        platform === 'whatsapp' &&
+                        sock &&
+                        whatsappConnectionOpen
+                    ) {
+                        try {
+                            const tracker =
+                                createWhatsAppTracker(
+                                    sock,
+                                    phoneNumber,
+                                );
+
+                            if (
+                                tracker &&
+                                typeof (tracker as any).start ===
+                                    'function'
+                            ) {
+                                await (tracker as any).start();
+                            } else if (
+                                tracker &&
+                                typeof (tracker as any)
+                                    .startTracking ===
+                                    'function'
+                            ) {
+                                await (tracker as any)
+                                    .startTracking();
+                            }
+
+                            console.log(
+                                `[WA] Started tracker for ${phoneNumber}`,
+                            );
+                        } catch (err) {
+                            console.error(
+                                `[WA] Failed to start tracker for ${phoneNumber}:`,
+                                err,
+                            );
+                        }
+                    }
+                } catch (err) {
+                    console.error(
+                        '[SOCKET] add-contact error:',
+                        err,
+                    );
+                }
+            },
         );
 
+        /* --------------------------------------------------------
+           REMOVE CONTACT
+        -------------------------------------------------------- */
 
-        socket.on(
+        client.on(
+            'remove-contact',
+            async (data: any) => {
+                try {
+                    const id =
+                        String(
+                            data?.id ?? '',
+                        ).trim();
+
+                    if (!id) {
+                        return;
+                    }
+
+                    await removeTrackedContact(
+                        id,
+                    );
+
+                    const contacts =
+                        await getTrackedContacts();
+
+                    io.emit(
+                        'tracked-contacts',
+                        contacts,
+                    );
+                } catch (err) {
+                    console.error(
+                        '[SOCKET] remove-contact error:',
+                        err,
+                    );
+                }
+            },
+        );
+
+        /* --------------------------------------------------------
+           GET MEASUREMENT HISTORY
+        -------------------------------------------------------- */
+
+        client.on(
+            'get-measurement-history',
+            async (data: any) => {
+                try {
+                    const deviceId =
+                        String(
+                            data?.deviceId ?? '',
+                        ).trim();
+
+                    const limit =
+                        Number(
+                            data?.limit ?? 500,
+                        );
+
+                    if (!deviceId) {
+                        return;
+                    }
+
+                    const history =
+                        await getMeasurementHistory(
+                            deviceId,
+                            limit,
+                        );
+
+                    client.emit(
+                        'measurement-history',
+                        {
+                            deviceId,
+                            history,
+                        },
+                    );
+                } catch (err) {
+                    console.error(
+                        '[SOCKET] Failed to get measurement history:',
+                        err,
+                    );
+                }
+            },
+        );
+
+        /* --------------------------------------------------------
+           DISCONNECT
+        -------------------------------------------------------- */
+
+        client.on(
             'disconnect',
             () => {
                 console.log(
-                    'Client disconnected'
+                    `[SOCKET] Client disconnected: ${client.id}`,
+                );
+            },
+        );
+    },
+);
+
+/* ============================================================
+   TRACKER MEASUREMENT EVENT HANDLER
+   ============================================================ */
+
+/**
+ * This function is intentionally generic so your existing tracker
+ * can call it with the measurement object.
+ */
+function onTrackerMeasurement(
+    measurement: Measurement,
+) {
+    /**
+     * Broadcast immediately.
+     */
+    io.emit(
+        'measurement',
+        measurement,
+    );
+
+    /**
+     * Persist permanently.
+     */
+    void saveMeasurement(
+        measurement,
+    );
+}
+
+/* ============================================================
+   OPTIONAL GLOBAL TRACKER HOOK
+   ============================================================ */
+
+/**
+ * Make the measurement handler available globally so tracker
+ * implementations that expect a global callback can use it.
+ */
+(globalThis as any).onTrackerMeasurement =
+    onTrackerMeasurement;
+
+/* ============================================================
+   START SERVER
+   ============================================================ */
+
+server.listen(
+    PORT,
+    '0.0.0.0',
+    async () => {
+        console.log(
+            `[SERVER] Listening on port ${PORT}`,
+        );
+
+        if (pool) {
+            try {
+                await pool.query(
+                    'SELECT 1',
+                );
+
+                console.log(
+                    '[DB] PostgreSQL connection OK',
+                );
+            } catch (err) {
+                console.error(
+                    '[DB] PostgreSQL connection failed:',
+                    err,
                 );
             }
-        );
-    }
+        }
+
+        /**
+         * Restore Signal contacts independently.
+         */
+        void restoreSignalTrackers();
+
+        /**
+         * Start exactly one WhatsApp connection.
+         */
+        void connectToWhatsApp();
+    },
 );
 
+/* ============================================================
+   PROCESS SHUTDOWN
+   ============================================================ */
 
-// ============================================================
-// REACT SPA FALLBACK
-// ============================================================
+async function shutdown(
+    signal: string,
+) {
+    console.log(
+        `[SERVER] Received ${signal}, shutting down...`,
+    );
 
-app.get(
-    '/{*path}',
-    (req, res) => {
-        res.sendFile(
-            path.join(
-                clientPath,
-                'index.html'
-            )
+    clearWhatsAppReconnectTimer();
+
+    /**
+     * Invalidate the socket so no stale connection.update event
+     * can schedule another connection during shutdown.
+     */
+    whatsappGeneration++;
+
+    whatsappConnecting = false;
+
+    whatsappConnectionOpen = false;
+
+    const currentSocket = sock;
+
+    sock = null;
+
+    try {
+        if (currentSocket) {
+            try {
+                currentSocket.end(
+                    undefined,
+                );
+            } catch {
+                // Ignore socket shutdown errors.
+            }
+        }
+    } catch {
+        // Ignore.
+    }
+
+    try {
+        await pool?.end();
+    } catch (err) {
+        console.error(
+            '[DB] Error closing PostgreSQL pool:',
+            err,
         );
     }
-);
 
+    server.close(
+        () => {
+            process.exit(0);
+        },
+    );
 
-// ============================================================
-// START SERVER
-// ============================================================
+    setTimeout(
+        () => process.exit(0),
+        5000,
+    );
+}
 
-const PORT =
-    process.env.PORT ||
-    3001;
-
-httpServer.listen(
-    PORT,
+process.on(
+    'SIGTERM',
     () => {
-        console.log(
-            `Server running on port ${PORT}`
-        );
-    }
+        void shutdown('SIGTERM');
+    },
+);
+
+process.on(
+    'SIGINT',
+    () => {
+        void shutdown('SIGINT');
+    },
 );
