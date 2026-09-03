@@ -22,7 +22,7 @@ const encodeAuth = (user: string, pass: string) => {
 };
 
 // 3. Force the connection straight to your live Render link with fallbacks
-const API_URL = 'https://onrender.com';
+const API_URL = 'https://at-b3fr.onrender.com/';
 export const socket: Socket = io(API_URL, {
     transports: ['websocket', 'polling'],
     autoConnect: true,
