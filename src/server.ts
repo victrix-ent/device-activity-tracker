@@ -1,5 +1,7 @@
 import express from 'express';
 import http from 'http';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import { Server } from 'socket.io';
 import { Pool } from 'pg';
 import pino from 'pino';
@@ -35,6 +37,38 @@ const io = new Server(server, {
         methods: ['GET', 'POST'],
     },
 });
+
+
+/* ============================================================
+   FRONTEND PATH
+   ============================================================ */
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+/*
+ * In production:
+ *
+ * repository/
+ *   client/
+ *     dist/
+ *       index.html
+ *
+ * This server is compiled into:
+ *
+ *   dist/server.js
+ *
+ * Therefore we resolve the frontend from the
+ * project root rather than from src/.
+ */
+const clientDistPath = path.resolve(
+    __dirname,
+    '../client/dist',
+);
+
+console.log(
+    `[WEB] Frontend directory: ${clientDistPath}`,
+);
 
 
 /* ============================================================
@@ -122,7 +156,6 @@ let currentWhatsAppQr:
 let whatsappRestoreInProgress =
     false;
 
-
 /*
  * Prevents repeated reconnect attempts from
  * creating a socket while another attempt is active.
@@ -136,41 +169,6 @@ let whatsappReconnectAttempts = 0;
 
 const whatsappTrackers =
     new Map<string, WhatsAppTracker>();
-
-
-/* ============================================================
-   BASIC HTTP ROUTES
-   ============================================================ */
-
-app.get(
-    '/',
-    (_req, res) => {
-        res.json({
-            ok: true,
-            service:
-                'device-activity-tracker',
-
-            whatsappConnected:
-                whatsappConnectionOpen,
-        });
-    },
-);
-
-
-app.get(
-    '/health',
-    (_req, res) => {
-        res.json({
-            ok: true,
-
-            database:
-                !!pool,
-
-            whatsappConnected:
-                whatsappConnectionOpen,
-        });
-    },
-);
 
 
 /* ============================================================
@@ -827,10 +825,10 @@ function scheduleWhatsAppReconnect() {
      * 1st retry  = 5s
      * 2nd retry  = 10s
      * 3rd retry  = 20s
-     * ...
-     *
-     * Maximum = 60s
+     * 4th retry  = 40s
+     * 5th+       = 60s
      */
+
     whatsappReconnectAttempts++;
 
     const delay =
@@ -887,17 +885,8 @@ function invalidateWhatsAppSocket(
     }
 
     /*
-     * IMPORTANT:
-     *
-     * Do NOT increment whatsappGeneration here.
-     *
      * Generation belongs to connectToWhatsApp().
-     * Incrementing it during close caused:
-     *
-     * generation 1 -> generation 2
-     * reconnect -> generation 3
-     *
-     * which made the lifecycle unnecessarily confusing.
+     * Do not increment it here.
      */
 
     sock = null;
@@ -1214,13 +1203,12 @@ async function connectToWhatsApp() {
                        DIAGNOSTIC MODE
                        =================================================
 
-                       Keep tracker restoration disabled.
+                       Tracker restoration remains disabled for now.
 
-                       The purpose of this deployment is to verify
-                       whether the persisted WhatsApp socket itself
-                       can remain connected.
+                       The probe loop in tracker.ts is also disabled.
 
-                       DO NOT start the tracker yet.
+                       This keeps the WhatsApp connection itself isolated
+                       while testing session persistence/stability.
                     */
 
                     console.log(
@@ -1349,12 +1337,7 @@ async function connectToWhatsApp() {
                         );
 
                         /*
-                         * IMPORTANT:
-                         *
                          * Do not immediately reconnect after 440.
-                         *
-                         * A rapid reconnect loop can make a
-                         * session conflict much harder to diagnose.
                          */
                         scheduleWhatsAppReconnect();
 
@@ -1523,9 +1506,8 @@ io.on(
                      * Tracker startup remains available
                      * for explicit contact additions.
                      *
-                     * NOTE:
-                     * tracker.ts currently has its probe loop
-                     * disabled for diagnostics.
+                     * tracker.ts currently has its
+                     * probe loop disabled for diagnostics.
                      */
 
                     if (
@@ -1680,6 +1662,123 @@ io.on(
 
 
 /* ============================================================
+   FRONTEND STATIC FILES
+   ============================================================ */
+
+/*
+ * Serve the React/Vite production build.
+ *
+ * IMPORTANT:
+ * This must be registered before the SPA fallback.
+ */
+
+app.use(
+    express.static(
+        clientDistPath,
+        {
+            index: false,
+        },
+    ),
+);
+
+
+/*
+ * Root URL:
+ *
+ * https://at-b3fr.onrender.com/
+ *
+ * should open the tracker interface instead of JSON.
+ */
+
+app.get(
+    '/',
+    (_req, res) => {
+        res.sendFile(
+            path.join(
+                clientDistPath,
+                'index.html',
+            ),
+        );
+    },
+);
+
+
+/*
+ * React Router / SPA fallback.
+ *
+ * If the user directly opens something such as:
+ *
+ * /dashboard
+ *
+ * return index.html so the React application can
+ * handle the route on the client.
+ *
+ * API/health endpoints are excluded.
+ */
+
+app.use(
+    (req, res, next) => {
+        if (
+            req.method !==
+            'GET'
+        ) {
+            next();
+            return;
+        }
+
+        if (
+            req.path ===
+                '/health' ||
+            req.path.startsWith(
+                '/socket.io',
+            )
+        ) {
+            next();
+            return;
+        }
+
+        /*
+         * If Express reaches here, the static
+         * frontend did not find a matching file.
+         *
+         * Return the React application.
+         */
+        res.sendFile(
+            path.join(
+                clientDistPath,
+                'index.html',
+            ),
+            (err) => {
+                if (err) {
+                    next(err);
+                }
+            },
+        );
+    },
+);
+
+
+/* ============================================================
+   HEALTH
+   ============================================================ */
+
+app.get(
+    '/health',
+    (_req, res) => {
+        res.json({
+            ok: true,
+
+            database:
+                !!pool,
+
+            whatsappConnected:
+                whatsappConnectionOpen,
+        });
+    },
+);
+
+
+/* ============================================================
    SERVER START
    ============================================================ */
 
@@ -1689,6 +1788,10 @@ server.listen(
     async () => {
         console.log(
             `[SERVER] Listening on port ${PORT}`,
+        );
+
+        console.log(
+            `[WEB] Serving frontend from ${clientDistPath}`,
         );
 
         if (pool) {
