@@ -14,9 +14,12 @@ import { Server } from 'socket.io';
 import cors from 'cors';
 import path from 'path';
 import makeWASocket, {
-    DisconnectReason,
-    useMultiFileAuthState
+    DisconnectReason
 } from '@whiskeysockets/baileys';
+
+import {
+    createDatabaseAuthState
+} from './baileys-db-auth.js';
 import { pino } from 'pino';
 import { Boom } from '@hapi/boom';
 import { Pool } from 'pg';
