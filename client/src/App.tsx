@@ -6,7 +6,7 @@ import { Dashboard } from './components/Dashboard';
 // Create socket with autoConnect disabled so we can add listeners before connecting
 const API_URL = 'https://at-b3fr.onrender.com';
 
-/// Checks if the device is already authorized, otherwise prompts for the password once
+// Persistent device authorization vault check
 let savedPassword = localStorage.getItem('tracker_password');
 if (!savedPassword) {
     const userInput = prompt('Enter your dashboard security password:');
@@ -16,13 +16,23 @@ if (!savedPassword) {
     }
 }
 
+// Universal cross-browser base64 conversion wrapper
+const encodeAuth = (user: string, pass: string) => {
+    try {
+        return 'Basic ' + btoa(unescape(encodeURIComponent(user + ':' + pass)));
+    } catch (e) {
+        return '';
+    }
+};
+
 export const socket: Socket = io('https://onrender.com', { 
     transports: ['websocket', 'polling'],
     autoConnect: true,
-    extraHeaders: {
-        Authorization: 'Basic ' + btoa('admin:' + (savedPassword || ''))
+    auth: {
+        token: encodeAuth('admin', savedPassword || '')
     }
 });
+
 
 
 export type Platform = 'whatsapp' | 'signal';
