@@ -230,22 +230,27 @@ checkSignalConnection();
 setInterval(checkSignalConnection, 5000);
 
 
-// Add this block right BEFORE io.on('connection', ...) to let the frontend connect:
+// Standard validation layout to verify the incoming device password token
 io.use((socket, next) => {
-    const authHeader = socket.handshake.headers.authorization;
-    if (!authHeader) {
+    const authHeader = socket.handshake.auth?.token;
+    if (!authHeader || !authHeader.startsWith('Basic ')) {
+        console.log('[AUTH ERROR] Missing or invalid credentials configuration format');
         return next(new Error('Authentication error'));
     }
-    const token = authHeader.split(' ')[1];
-    const decoded = Buffer.from(token, 'base64').toString('utf8');
+    
+    const base64Credentials = authHeader.split(' ')[1];
+    const decoded = Buffer.from(base64Credentials, 'base64').toString('utf8');
     const [username, password] = decoded.split(':');
     
     const expectedPassword = process.env.DASHBOARD_PASSWORD || 'fallback_temporary_password';
     if (username === 'admin' && password === expectedPassword) {
         return next();
     }
+    
+    console.log('[AUTH ERROR] Password credentials mismatch');
     return next(new Error('Authentication error'));
 });
+
 
 // Establish WebSocket listeners
 io.on('connection', (socket) => {
