@@ -1,4 +1,3 @@
-
 import express from 'express';
 import http from 'http';
 import { Server } from 'socket.io';
@@ -14,12 +13,18 @@ import {
 } from './baileys-db-auth.js';
 
 import {
-    createWhatsAppTracker,
+    WhatsAppTracker,
 } from './tracker.js';
+
+
+/* ============================================================
+   SERVER
+   ============================================================ */
 
 const PORT = Number(process.env.PORT || 3000);
 
 const app = express();
+
 const server = http.createServer(app);
 
 const io = new Server(server, {
@@ -28,6 +33,11 @@ const io = new Server(server, {
         methods: ['GET', 'POST'],
     },
 });
+
+
+/* ============================================================
+   DATABASE
+   ============================================================ */
 
 const databaseUrl = process.env.DATABASE_URL;
 
@@ -41,18 +51,26 @@ const pool = databaseUrl
     : null;
 
 if (!pool) {
-    console.warn('[DB] DATABASE_URL is not configured');
+    console.error(
+        '[DB] DATABASE_URL is not configured',
+    );
 } else {
     pool.on('error', (err) => {
-        console.error('[DB] Unexpected PostgreSQL pool error:', err);
+        console.error(
+            '[DB] Unexpected PostgreSQL pool error:',
+            err,
+        );
     });
 }
+
 
 /* ============================================================
    TYPES
    ============================================================ */
 
-type TrackerPlatform = 'whatsapp' | 'signal';
+type TrackerPlatform =
+    | 'whatsapp'
+    | 'signal';
 
 interface TrackedContact {
     id: string;
@@ -70,63 +88,91 @@ interface Measurement {
     measuredAt?: string;
 }
 
+
 /* ============================================================
-   WHATSAPP STATE
+   WHATSAPP GLOBAL STATE
    ============================================================ */
 
 /**
- * IMPORTANT:
- *
- * Only this socket is allowed to be the active WhatsApp socket.
- *
- * generation is incremented every time the active socket is
- * invalidated. Events coming from an older socket are ignored.
+ * There must only ever be ONE active WhatsApp socket.
  */
 let sock: ReturnType<typeof makeWASocket> | null = null;
 
+/**
+ * Every socket gets a unique generation.
+ *
+ * If an old socket fires an event after a new socket has been
+ * created, that event is ignored.
+ */
 let whatsappGeneration = 0;
 
+/**
+ * True while a socket is being established.
+ */
 let whatsappConnecting = false;
 
+/**
+ * True only after Baileys reports connection === "open".
+ */
 let whatsappConnectionOpen = false;
 
+/**
+ * Only one reconnect timer may exist.
+ */
 let whatsappReconnectTimer: NodeJS.Timeout | null = null;
 
 let currentWhatsAppQr: string | null = null;
 
+/**
+ * Prevent restoring the same trackers multiple times.
+ */
 let whatsappRestoreInProgress = false;
 
+
 /* ============================================================
-   SIGNAL STATE
+   TRACKER STORAGE
    ============================================================ */
 
-let signalRestoreInProgress = false;
+/**
+ * Keep references to active trackers.
+ *
+ * The key is the database contact ID.
+ */
+const whatsappTrackers =
+    new Map<string, WhatsAppTracker>();
+
 
 /* ============================================================
-   BASIC ROUTES
+   BASIC HTTP ROUTES
    ============================================================ */
 
 app.get('/', (_req, res) => {
     res.json({
         ok: true,
         service: 'device-activity-tracker',
-        whatsappConnected: whatsappConnectionOpen,
+        whatsappConnected:
+            whatsappConnectionOpen,
     });
 });
+
 
 app.get('/health', (_req, res) => {
     res.json({
         ok: true,
-        whatsappConnected: whatsappConnectionOpen,
         database: !!pool,
+        whatsappConnected:
+            whatsappConnectionOpen,
     });
 });
 
+
 /* ============================================================
-   DATABASE HELPERS
+   DATABASE — MEASUREMENTS
    ============================================================ */
 
-async function saveMeasurement(measurement: Measurement) {
+async function saveMeasurement(
+    measurement: Measurement,
+) {
     if (!pool) {
         return;
     }
@@ -135,17 +181,25 @@ async function saveMeasurement(measurement: Measurement) {
         await pool.query(
             `
             INSERT INTO measurements
-                (
-                    device_id,
-                    rtt,
-                    avg,
-                    median,
-                    threshold,
-                    state,
-                    measured_at
-                )
+            (
+                device_id,
+                rtt,
+                avg,
+                median,
+                threshold,
+                state,
+                measured_at
+            )
             VALUES
-                ($1, $2, $3, $4, $5, $6, COALESCE($7::timestamptz, NOW()))
+            (
+                $1,
+                $2,
+                $3,
+                $4,
+                $5,
+                $6,
+                COALESCE($7::timestamptz, NOW())
+            )
             `,
             [
                 measurement.deviceId,
@@ -158,9 +212,13 @@ async function saveMeasurement(measurement: Measurement) {
             ],
         );
     } catch (err) {
-        console.error('[DB] Failed to save measurement:', err);
+        console.error(
+            '[DB] Failed to save measurement:',
+            err,
+        );
     }
 }
+
 
 async function getMeasurementHistory(
     deviceId: string,
@@ -171,36 +229,69 @@ async function getMeasurementHistory(
     }
 
     try {
-        const result = await pool.query(
-            `
-            SELECT
-                device_id,
-                rtt,
-                avg,
-                median,
-                threshold,
-                state,
-                measured_at
-            FROM measurements
-            WHERE device_id = $1
-            ORDER BY measured_at DESC
-            LIMIT $2
-            `,
-            [deviceId, Math.min(Math.max(limit, 1), 5000)],
-        );
+        const safeLimit =
+            Math.min(
+                Math.max(
+                    Number(limit) || 500,
+                    1,
+                ),
+                5000,
+            );
 
-        return result.rows.map((row) => ({
-            deviceId: row.device_id,
-            rtt: row.rtt === null ? null : Number(row.rtt),
-            avg: row.avg === null ? null : Number(row.avg),
-            median: row.median === null ? null : Number(row.median),
-            threshold:
-                row.threshold === null
-                    ? null
-                    : Number(row.threshold),
-            state: row.state,
-            measuredAt: row.measured_at,
-        }));
+        const result =
+            await pool.query(
+                `
+                SELECT
+                    device_id,
+                    rtt,
+                    avg,
+                    median,
+                    threshold,
+                    state,
+                    measured_at
+                FROM measurements
+                WHERE device_id = $1
+                ORDER BY measured_at DESC
+                LIMIT $2
+                `,
+                [
+                    deviceId,
+                    safeLimit,
+                ],
+            );
+
+        return result.rows.map(
+            (row) => ({
+                deviceId:
+                    row.device_id,
+
+                rtt:
+                    row.rtt === null
+                        ? null
+                        : Number(row.rtt),
+
+                avg:
+                    row.avg === null
+                        ? null
+                        : Number(row.avg),
+
+                median:
+                    row.median === null
+                        ? null
+                        : Number(row.median),
+
+                threshold:
+                    row.threshold === null
+                        ? null
+                        : Number(row.threshold),
+
+                state:
+                    row.state,
+
+                measuredAt:
+                    row.measured_at,
+            }),
+        );
     } catch (err) {
         console.error(
             '[DB] Failed to get measurement history:',
@@ -211,8 +302,9 @@ async function getMeasurementHistory(
     }
 }
 
+
 /* ============================================================
-   TRACKED CONTACT DATABASE
+   DATABASE — TRACKED CONTACTS
    ============================================================ */
 
 async function saveTrackedContact(
@@ -228,17 +320,23 @@ async function saveTrackedContact(
         await pool.query(
             `
             INSERT INTO tracked_contacts
-                (
-                    id,
-                    platform,
-                    phone_number
-                )
+            (
+                id,
+                platform,
+                phone_number
+            )
             VALUES
-                ($1, $2, $3)
+            (
+                $1,
+                $2,
+                $3
+            )
             ON CONFLICT (id)
             DO UPDATE SET
-                platform = EXCLUDED.platform,
-                phone_number = EXCLUDED.phone_number
+                platform =
+                    EXCLUDED.platform,
+                phone_number =
+                    EXCLUDED.phone_number
             `,
             [
                 id,
@@ -258,7 +356,10 @@ async function saveTrackedContact(
     }
 }
 
-async function removeTrackedContact(id: string) {
+
+async function removeTrackedContact(
+    id: string,
+) {
     if (!pool) {
         return;
     }
@@ -272,7 +373,9 @@ async function removeTrackedContact(id: string) {
             [id],
         );
 
-        console.log(`[DB] Removed tracked contact: ${id}`);
+        console.log(
+            `[DB] Removed tracked contact: ${id}`,
+        );
     } catch (err) {
         console.error(
             '[DB] Failed to remove tracked contact:',
@@ -281,28 +384,38 @@ async function removeTrackedContact(id: string) {
     }
 }
 
-async function getTrackedContacts(): Promise<TrackedContact[]> {
+
+async function getTrackedContacts():
+    Promise<TrackedContact[]> {
     if (!pool) {
         return [];
     }
 
     try {
-        const result = await pool.query(
-            `
-            SELECT
-                id,
-                platform,
-                phone_number
-            FROM tracked_contacts
-            ORDER BY created_at ASC
-            `,
-        );
+        const result =
+            await pool.query(
+                `
+                SELECT
+                    id,
+                    platform,
+                    phone_number
+                FROM tracked_contacts
+                ORDER BY created_at ASC
+                `,
+            );
 
-        return result.rows.map((row) => ({
-            id: row.id,
-            platform: row.platform,
-            phoneNumber: row.phone_number,
-        }));
+        return result.rows.map(
+            (row) => ({
+                id:
+                    row.id,
+
+                platform:
+                    row.platform,
+
+                phoneNumber:
+                    row.phone_number,
+            }),
+        );
     } catch (err) {
         console.error(
             '[DB] Failed to get tracked contacts:',
@@ -313,101 +426,303 @@ async function getTrackedContacts(): Promise<TrackedContact[]> {
     }
 }
 
+
 /* ============================================================
-   WHATSAPP TRACKER RESTORATION
+   MEASUREMENT HANDLER
    ============================================================ */
 
-async function restoreWhatsAppTrackers(
-    socket: ReturnType<typeof makeWASocket>,
+function handleTrackerUpdate(
+    contact: TrackedContact,
+    data: any,
 ) {
-    if (whatsappRestoreInProgress) {
-        console.log(
-            '[RESTORE] WhatsApp tracker restoration already running',
+    /**
+     * The tracker sends:
+     *
+     * {
+     *   devices,
+     *   deviceCount,
+     *   presence,
+     *   median,
+     *   threshold
+     * }
+     *
+     * Each device can have its own RTT/state.
+     *
+     * Persist the primary target/device data.
+     */
+
+    const devices =
+        Array.isArray(data?.devices)
+            ? data.devices
+            : [];
+
+    if (devices.length === 0) {
+        io.emit(
+            'tracker-update',
+            {
+                deviceId:
+                    contact.id,
+
+                ...data,
+            },
         );
 
         return;
     }
 
-    if (socket !== sock) {
+    for (const device of devices) {
+        const measurement: Measurement = {
+            deviceId:
+                contact.id,
+
+            rtt:
+                typeof device.rtt === 'number'
+                    ? device.rtt
+                    : null,
+
+            avg:
+                typeof device.avg === 'number'
+                    ? device.avg
+                    : null,
+
+            median:
+                typeof data.median === 'number'
+                    ? data.median
+                    : null,
+
+            threshold:
+                typeof data.threshold === 'number'
+                    ? data.threshold
+                    : null,
+
+            state:
+                typeof device.state === 'string'
+                    ? device.state
+                    : null,
+
+            measuredAt:
+                new Date().toISOString(),
+        };
+
+        void saveMeasurement(
+            measurement,
+        );
+    }
+
+    /**
+     * Send the complete tracker update to the frontend.
+     */
+    io.emit(
+        'tracker-update',
+        {
+            deviceId:
+                contact.id,
+
+            ...data,
+        },
+    );
+
+    /**
+     * Also emit the measurement event used by the existing
+     * dashboard if it listens for "measurement".
+     */
+    if (devices.length > 0) {
+        for (const device of devices) {
+            io.emit(
+                'measurement',
+                {
+                    deviceId:
+                        contact.id,
+
+                    rtt:
+                        typeof device.rtt === 'number'
+                            ? device.rtt
+                            : null,
+
+                    avg:
+                        typeof device.avg === 'number'
+                            ? device.avg
+                            : null,
+
+                    median:
+                        typeof data.median === 'number'
+                            ? data.median
+                            : null,
+
+                    threshold:
+                        typeof data.threshold === 'number'
+                            ? data.threshold
+                            : null,
+
+                    state:
+                        device.state ?? null,
+
+                    measuredAt:
+                        new Date().toISOString(),
+                },
+            );
+        }
+    }
+}
+
+
+/* ============================================================
+   CREATE WHATSAPP TRACKER
+   ============================================================ */
+
+async function startWhatsAppTracker(
+    contact: TrackedContact,
+) {
+    if (!sock) {
         console.log(
-            '[RESTORE] Ignoring restoration for stale WhatsApp socket',
+            `[WA] Cannot start tracker ${contact.phoneNumber}: no socket`,
         );
 
+        return;
+    }
+
+    if (!whatsappConnectionOpen) {
+        console.log(
+            `[WA] Cannot start tracker ${contact.phoneNumber}: WhatsApp is not open`,
+        );
+
+        return;
+    }
+
+    /**
+     * Do not create duplicate trackers for the same contact.
+     */
+    if (
+        whatsappTrackers.has(
+            contact.id,
+        )
+    ) {
+        console.log(
+            `[WA] Tracker already running: ${contact.phoneNumber}`,
+        );
+
+        return;
+    }
+
+    const tracker =
+        new WhatsAppTracker(
+            sock,
+            contact.phoneNumber,
+        );
+
+    tracker.onUpdate =
+        (data) => {
+            handleTrackerUpdate(
+                contact,
+                data,
+            );
+        };
+
+    whatsappTrackers.set(
+        contact.id,
+        tracker,
+    );
+
+    try {
+        await tracker.startTracking();
+
+        console.log(
+            `[WA] Tracker started: ${contact.phoneNumber}`,
+        );
+    } catch (err) {
+        whatsappTrackers.delete(
+            contact.id,
+        );
+
+        console.error(
+            `[WA] Failed to start tracker ${contact.phoneNumber}:`,
+            err,
+        );
+    }
+}
+
+
+/* ============================================================
+   RESTORE WHATSAPP TRACKERS
+   ============================================================ */
+
+async function restoreWhatsAppTrackers(
+    socket: ReturnType<typeof makeWASocket>,
+    generation: number,
+) {
+    if (whatsappRestoreInProgress) {
+        console.log(
+            '[RESTORE] WhatsApp restoration already in progress',
+        );
+
+        return;
+    }
+
+    /**
+     * Make absolutely sure this is still the active socket.
+     */
+    if (
+        socket !== sock ||
+        generation !== whatsappGeneration
+    ) {
+        console.log(
+            '[RESTORE] Ignoring stale socket restoration',
+        );
+
+        return;
+    }
+
+    if (!whatsappConnectionOpen) {
         return;
     }
 
     whatsappRestoreInProgress = true;
 
     try {
-        const contacts = await getTrackedContacts();
+        const contacts =
+            await getTrackedContacts();
 
-        const whatsappContacts = contacts.filter(
-            (contact) =>
-                contact.platform === 'whatsapp',
-        );
+        const whatsappContacts =
+            contacts.filter(
+                (contact) =>
+                    contact.platform ===
+                    'whatsapp',
+            );
 
         console.log(
             `[RESTORE] Found ${whatsappContacts.length} saved WhatsApp tracker(s)`,
         );
 
-        for (const contact of whatsappContacts) {
+        for (
+            const contact
+            of whatsappContacts
+        ) {
             /**
-             * Check again before creating each tracker.
-             *
-             * The socket could have disconnected while we were
-             * restoring another tracker.
+             * Socket may disconnect while restoring contacts.
              */
-            if (socket !== sock || !whatsappConnectionOpen) {
+            if (
+                socket !== sock ||
+                generation !== whatsappGeneration ||
+                !whatsappConnectionOpen
+            ) {
                 console.log(
-                    '[RESTORE] WhatsApp socket is no longer active; stopping restoration',
+                    '[RESTORE] Socket became stale; stopping restoration',
                 );
 
                 break;
             }
 
-            try {
-                console.log(
-                    `[RESTORE] Restoring WhatsApp tracker: ${contact.phoneNumber}`,
-                );
+            console.log(
+                `[RESTORE] Restoring WhatsApp tracker: ${contact.phoneNumber}`,
+            );
 
-                const tracker = createWhatsAppTracker(
-                    socket,
-                    contact.phoneNumber,
-                );
-
-                /**
-                 * Depending on your tracker implementation,
-                 * createWhatsAppTracker may return an object with
-                 * start()/startTracking().
-                 *
-                 * Try the available method without requiring a
-                 * specific implementation.
-                 */
-                if (
-                    tracker &&
-                    typeof (tracker as any).start === 'function'
-                ) {
-                    await (tracker as any).start();
-                } else if (
-                    tracker &&
-                    typeof (tracker as any).startTracking === 'function'
-                ) {
-                    await (tracker as any).startTracking();
-                }
-
-                console.log(
-                    `[RESTORE] Restored WhatsApp tracker: ${contact.phoneNumber}`,
-                );
-            } catch (err) {
-                console.error(
-                    `[RESTORE] Failed to restore WhatsApp tracker ${contact.phoneNumber}:`,
-                    err,
-                );
-            }
+            await startWhatsAppTracker(
+                contact,
+            );
         }
     } catch (err) {
         console.error(
-            '[RESTORE] Failed to restore WhatsApp trackers:',
+            '[RESTORE] WhatsApp tracker restoration failed:',
             err,
         );
     } finally {
@@ -415,9 +730,14 @@ async function restoreWhatsAppTrackers(
     }
 }
 
+
 /* ============================================================
-   SIGNAL TRACKER RESTORATION
+   SIGNAL RESTORATION
    ============================================================ */
+
+let signalRestoreInProgress =
+    false;
+
 
 async function restoreSignalTrackers() {
     if (signalRestoreInProgress) {
@@ -427,31 +747,37 @@ async function restoreSignalTrackers() {
     signalRestoreInProgress = true;
 
     try {
-        const contacts = await getTrackedContacts();
+        const contacts =
+            await getTrackedContacts();
 
-        const signalContacts = contacts.filter(
-            (contact) =>
-                contact.platform === 'signal',
-        );
+        const signalContacts =
+            contacts.filter(
+                (contact) =>
+                    contact.platform ===
+                    'signal',
+            );
 
         console.log(
             `[RESTORE] Found ${signalContacts.length} saved Signal tracker(s)`,
         );
 
         /**
-         * Keep the Signal restoration hook here.
+         * Keep the saved Signal contacts available.
          *
-         * Your existing Signal tracker implementation can be
-         * inserted here if it exposes a restore/start function.
+         * The actual Signal tracker implementation can be
+         * restored here when its runtime/API is available.
          */
-        for (const contact of signalContacts) {
+        for (
+            const contact
+            of signalContacts
+        ) {
             console.log(
                 `[RESTORE] Signal tracker saved: ${contact.phoneNumber}`,
             );
         }
     } catch (err) {
         console.error(
-            '[RESTORE] Failed to restore Signal trackers:',
+            '[RESTORE] Signal restoration failed:',
             err,
         );
     } finally {
@@ -459,55 +785,69 @@ async function restoreSignalTrackers() {
     }
 }
 
+
 /* ============================================================
-   WHATSAPP RECONNECT MANAGEMENT
+   WHATSAPP RECONNECT CONTROL
    ============================================================ */
 
-/**
- * Cancel the currently scheduled reconnect.
- */
 function clearWhatsAppReconnectTimer() {
-    if (whatsappReconnectTimer) {
-        clearTimeout(whatsappReconnectTimer);
-        whatsappReconnectTimer = null;
+    if (
+        whatsappReconnectTimer
+    ) {
+        clearTimeout(
+            whatsappReconnectTimer,
+        );
+
+        whatsappReconnectTimer =
+            null;
     }
 }
 
-/**
- * Schedule exactly ONE reconnect.
- *
- * This is deliberately centralized so multiple close events
- * cannot create multiple sockets.
- */
+
 function scheduleWhatsAppReconnect() {
-    if (whatsappReconnectTimer) {
+    /**
+     * Never create multiple reconnect timers.
+     */
+    if (
+        whatsappReconnectTimer
+    ) {
         console.log(
-            '[WA] Reconnect already scheduled, skipping duplicate',
+            '[WA] Reconnect already scheduled',
         );
 
         return;
     }
 
     console.log(
-        '[WA] Scheduling reconnect in 2 seconds',
+        '[WA] Scheduling WhatsApp reconnect in 2 seconds',
     );
 
-    whatsappReconnectTimer = setTimeout(() => {
-        whatsappReconnectTimer = null;
+    whatsappReconnectTimer =
+        setTimeout(
+            () => {
+                whatsappReconnectTimer =
+                    null;
 
-        void connectToWhatsApp();
-    }, 2000);
+                void connectToWhatsApp();
+            },
+            2000,
+        );
 }
 
+
 /**
- * Invalidate the current socket.
+ * Completely invalidate the current socket.
  *
- * Incrementing generation means all listeners belonging to the
- * old socket become stale immediately.
+ * This is the key part of the duplicate-connection fix.
  */
 function invalidateWhatsAppSocket(
-    socketToInvalidate?: ReturnType<typeof makeWASocket>,
+    socketToInvalidate?:
+        ReturnType<typeof makeWASocket>,
 ) {
+    /**
+     * If a stale socket tries to invalidate the current socket,
+     * ignore it.
+     */
     if (
         socketToInvalidate &&
         sock &&
@@ -516,16 +856,26 @@ function invalidateWhatsAppSocket(
         return;
     }
 
+    /**
+     * Increment generation FIRST.
+     *
+     * Any events emitted after this point become stale.
+     */
     whatsappGeneration++;
 
     sock = null;
 
-    whatsappConnectionOpen = false;
+    whatsappConnectionOpen =
+        false;
 
-    currentWhatsAppQr = null;
+    currentWhatsAppQr =
+        null;
 
-    io.emit('connection-closed');
+    io.emit(
+        'connection-closed',
+    );
 }
+
 
 /* ============================================================
    WHATSAPP CONNECTION
@@ -534,43 +884,64 @@ function invalidateWhatsAppSocket(
 async function connectToWhatsApp() {
     if (!pool) {
         console.error(
-            '[WA] DATABASE_URL is required for WhatsApp session persistence',
+            '[WA] DATABASE_URL is required for WhatsApp authentication persistence',
         );
 
         return;
     }
 
     /**
-     * If we already have an active socket or a connection attempt,
-     * NEVER create another one.
+     * HARD LOCK:
+     *
+     * Don't create another socket while one is being created.
      */
     if (whatsappConnecting) {
         console.log(
-            '[WA] Connection attempt already in progress, skipping',
+            '[WA] Connection attempt already in progress — skipping',
         );
 
         return;
     }
 
-    if (sock && whatsappConnectionOpen) {
+    /**
+     * HARD LOCK:
+     *
+     * Don't create another socket while one is already open.
+     */
+    if (
+        sock &&
+        whatsappConnectionOpen
+    ) {
         console.log(
-            '[WA] WhatsApp is already connected, skipping duplicate connection',
+            '[WA] WhatsApp already connected — skipping duplicate connection',
         );
 
         return;
     }
 
-    if (sock && !whatsappConnectionOpen) {
+    /**
+     * Also don't create another socket if one exists and is still
+     * connecting.
+     */
+    if (
+        sock &&
+        !whatsappConnectionOpen
+    ) {
         console.log(
-            '[WA] Existing WhatsApp socket is still being established; skipping duplicate connection',
+            '[WA] Existing WhatsApp socket is still connecting — skipping',
         );
 
         return;
     }
 
-    whatsappConnecting = true;
+    whatsappConnecting =
+        true;
 
-    const generation = ++whatsappGeneration;
+    /**
+     * Each socket receives its own generation.
+     */
+    const generation =
+        ++whatsappGeneration;
 
     console.log(
         `[WA] Starting WhatsApp connection generation ${generation}`,
@@ -579,61 +950,79 @@ async function connectToWhatsApp() {
     try {
         clearWhatsAppReconnectTimer();
 
+        /**
+         * Load persistent credentials from PostgreSQL.
+         */
         const {
             state,
             saveCreds,
-        } = await createDatabaseAuthState(
-            pool,
-            'whatsapp-main',
-        );
+        } =
+            await createDatabaseAuthState(
+                pool,
+                'whatsapp-main',
+            );
 
         /**
-         * Another connection could theoretically have started while
-         * the database auth state was loading.
+         * Make sure another connection wasn't created while
+         * PostgreSQL was loading.
          */
-        if (generation !== whatsappGeneration) {
+        if (
+            generation !==
+            whatsappGeneration
+        ) {
             console.log(
                 `[WA] Generation ${generation} became stale before socket creation`,
             );
+
+            whatsappConnecting =
+                false;
 
             return;
         }
 
         if (sock) {
             console.log(
-                '[WA] Socket appeared while loading auth state; refusing to create another socket',
+                '[WA] A socket appeared during auth loading — refusing duplicate socket',
             );
+
+            whatsappConnecting =
+                false;
 
             return;
         }
 
-        const newSock = makeWASocket({
-            auth: state,
+        /**
+         * Create exactly ONE Baileys socket.
+         */
+        const newSock =
+            makeWASocket({
+                auth: state,
 
-            logger: pino({
-                level: 'debug',
-            }),
+                logger:
+                    pino({
+                        level: 'silent',
+                    }),
 
-            markOnlineOnConnect: true,
+                markOnlineOnConnect:
+                    true,
 
-            printQRInTerminal: false,
-
-            /**
-             * Keep the normal Baileys defaults.
-             */
-        });
+                printQRInTerminal:
+                    false,
+            });
 
         /**
-         * IMPORTANT:
-         *
-         * Assign the socket exactly once.
+         * Assign it immediately.
          */
-        sock = newSock;
+        sock =
+            newSock;
 
         console.log(
-            `[WA] Socket created for generation ${generation}`,
+            `[WA] Socket created — generation ${generation}`,
         );
 
+        /**
+         * Save every credential change to PostgreSQL.
+         */
         newSock.ev.on(
             'creds.update',
             async () => {
@@ -648,9 +1037,15 @@ async function connectToWhatsApp() {
             },
         );
 
+        /* ========================================================
+           CONNECTION UPDATE
+        ======================================================== */
+
         newSock.ev.on(
             'connection.update',
-            async (update: any) => {
+            async (
+                update: any,
+            ) => {
                 const {
                     connection,
                     lastDisconnect,
@@ -658,26 +1053,41 @@ async function connectToWhatsApp() {
                 } = update;
 
                 /**
-                 * CRITICAL:
+                 * CRITICAL GENERATION CHECK.
                  *
-                 * Ignore EVERY event emitted by an old socket.
+                 * If this isn't the current socket, ignore it.
                  *
-                 * This is what prevents stale sockets from spawning
-                 * another connection.
+                 * This prevents:
+                 *
+                 * OLD SOCKET
+                 *      ↓
+                 * connection.close
+                 *      ↓
+                 * reconnect
+                 *      ↓
+                 * NEW SOCKET
+                 *
+                 * from being triggered repeatedly.
                  */
                 if (
                     newSock !== sock ||
-                    generation !== whatsappGeneration
+                    generation !==
+                        whatsappGeneration
                 ) {
                     console.log(
-                        `[WA] Ignoring stale socket event from generation ${generation}`,
+                        `[WA] Ignoring event from stale generation ${generation}`,
                     );
 
                     return;
                 }
 
+                /* ------------------------------------------------
+                   QR
+                ------------------------------------------------ */
+
                 if (qr) {
-                    currentWhatsAppQr = qr;
+                    currentWhatsAppQr =
+                        qr;
 
                     io.emit(
                         'qr',
@@ -689,12 +1099,20 @@ async function connectToWhatsApp() {
                     );
                 }
 
-                if (connection === 'connecting') {
+                /* ------------------------------------------------
+                   CONNECTING
+                ------------------------------------------------ */
+
+                if (
+                    connection ===
+                    'connecting'
+                ) {
                     console.log(
                         `[WA] Connecting... generation ${generation}`,
                     );
 
-                    whatsappConnectionOpen = false;
+                    whatsappConnectionOpen =
+                        false;
 
                     io.emit(
                         'connection-state',
@@ -702,16 +1120,38 @@ async function connectToWhatsApp() {
                     );
                 }
 
-                if (connection === 'open') {
+                /* ------------------------------------------------
+                   OPEN
+                ------------------------------------------------ */
+
+                if (
+                    connection ===
+                    'open'
+                ) {
+                    /**
+                     * Make sure this socket is STILL the current
+                     * socket before changing global state.
+                     */
+                    if (
+                        newSock !== sock ||
+                        generation !==
+                            whatsappGeneration
+                    ) {
+                        return;
+                    }
+
                     console.log(
-                        `[WA] WhatsApp connection OPEN generation ${generation}`,
+                        `[WA] WhatsApp OPEN — generation ${generation}`,
                     );
 
-                    whatsappConnectionOpen = true;
+                    whatsappConnectionOpen =
+                        true;
 
-                    currentWhatsAppQr = null;
+                    whatsappConnecting =
+                        false;
 
-                    whatsappConnecting = false;
+                    currentWhatsAppQr =
+                        null;
 
                     io.emit(
                         'connection-open',
@@ -723,47 +1163,91 @@ async function connectToWhatsApp() {
                     );
 
                     /**
-                     * Restore only after this socket is confirmed open.
+                     * Restore the persistent trackers only after
+                     * the socket is actually open.
                      */
                     await restoreWhatsAppTrackers(
                         newSock,
+                        generation,
                     );
                 }
 
-                if (connection === 'close') {
+                /* ------------------------------------------------
+                   CLOSE
+                ------------------------------------------------ */
+
+                if (
+                    connection ===
+                    'close'
+                ) {
+                    /**
+                     * Ignore close events from stale sockets.
+                     */
+                    if (
+                        newSock !== sock ||
+                        generation !==
+                            whatsappGeneration
+                    ) {
+                        console.log(
+                            `[WA] Ignoring close from stale generation ${generation}`,
+                        );
+
+                        return;
+                    }
+
                     const statusCode =
-                        (lastDisconnect?.error as Boom)
+                        (
+                            lastDisconnect
+                                ?.error as Boom
+                        )
                             ?.output
                             ?.statusCode;
 
                     const loggedOut =
-                        statusCode === DisconnectReason.loggedOut;
+                        statusCode ===
+                        DisconnectReason.loggedOut;
 
                     const shouldReconnect =
                         !loggedOut;
 
                     console.log(
-                        `[WA] Connection closed. statusCode=${statusCode}, reconnect=${shouldReconnect}, generation=${generation}`,
+                        `[WA] Connection closed — statusCode=${statusCode}, reconnect=${shouldReconnect}, generation=${generation}`,
                     );
 
                     /**
-                     * Mark this generation dead BEFORE doing anything
-                     * that could schedule another connection.
+                     * STOP all trackers belonging to this socket.
                      */
-                    if (
-                        newSock === sock &&
-                        generation === whatsappGeneration
+                    for (
+                        const tracker
+                        of whatsappTrackers.values()
                     ) {
-                        invalidateWhatsAppSocket(
-                            newSock,
-                        );
+                        try {
+                            tracker.stopTracking();
+                        } catch {
+                            // Ignore cleanup errors.
+                        }
                     }
 
-                    whatsappConnecting = false;
+                    whatsappTrackers.clear();
+
+                    /**
+                     * IMPORTANT:
+                     *
+                     * Invalidate BEFORE scheduling reconnect.
+                     *
+                     * This makes every subsequent event from this
+                     * socket stale.
+                     */
+                    invalidateWhatsAppSocket(
+                        newSock,
+                    );
+
+                    whatsappConnecting =
+                        false;
 
                     if (loggedOut) {
                         console.log(
-                            '[WA] Logged out. Automatic reconnect disabled.',
+                            '[WA] WhatsApp logged out. Automatic reconnect disabled.',
                         );
 
                         io.emit(
@@ -779,10 +1263,9 @@ async function connectToWhatsApp() {
                         'reconnecting',
                     );
 
-                    /**
-                     * Exactly one reconnect timer.
-                     */
-                    if (shouldReconnect) {
+                    if (
+                        shouldReconnect
+                    ) {
                         scheduleWhatsAppReconnect();
                     }
                 }
@@ -797,24 +1280,20 @@ async function connectToWhatsApp() {
         /**
          * Only invalidate if this is still the active generation.
          */
-        if (generation === whatsappGeneration) {
+        if (
+            generation ===
+            whatsappGeneration
+        ) {
             invalidateWhatsAppSocket();
         }
 
-        whatsappConnecting = false;
+        whatsappConnecting =
+            false;
 
         scheduleWhatsAppReconnect();
-    } finally {
-        /**
-         * Do NOT set whatsappConnecting=false here if the socket
-         * is still connecting.
-         *
-         * connection.update('open'/'close') handles that.
-         *
-         * This is intentional.
-         */
     }
 }
+
 
 /* ============================================================
    SOCKET.IO
@@ -828,7 +1307,7 @@ io.on(
         );
 
         /**
-         * Send current WhatsApp state immediately.
+         * Immediately tell the frontend the current state.
          */
         client.emit(
             'connection-state',
@@ -837,16 +1316,22 @@ io.on(
                 : 'closed',
         );
 
-        if (currentWhatsAppQr) {
+        /**
+         * Send current QR if one exists.
+         */
+        if (
+            currentWhatsAppQr
+        ) {
             client.emit(
                 'qr',
                 currentWhatsAppQr,
             );
         }
 
-        /* --------------------------------------------------------
+
+        /* ========================================================
            GET TRACKED CONTACTS
-        -------------------------------------------------------- */
+        ======================================================== */
 
         client.on(
             'get-tracked-contacts',
@@ -861,7 +1346,7 @@ io.on(
                     );
                 } catch (err) {
                     console.error(
-                        '[SOCKET] Failed to send tracked contacts:',
+                        '[SOCKET] Failed to get tracked contacts:',
                         err,
                     );
 
@@ -873,31 +1358,37 @@ io.on(
             },
         );
 
-        /* --------------------------------------------------------
+
+        /* ========================================================
            ADD CONTACT
-        -------------------------------------------------------- */
+        ======================================================== */
 
         client.on(
             'add-contact',
-            async (data: any) => {
+            async (
+                data: any,
+            ) => {
                 try {
                     const platform =
                         data?.platform as TrackerPlatform;
 
                     const phoneNumber =
                         String(
-                            data?.phoneNumber ?? '',
+                            data?.phoneNumber ??
+                                '',
                         ).trim();
 
                     const id =
                         String(
                             data?.id ??
-                            `${platform}:${phoneNumber}`,
-                        );
+                                `${platform}:${phoneNumber}`,
+                        ).trim();
 
                     if (
-                        platform !== 'whatsapp' &&
-                        platform !== 'signal'
+                        platform !==
+                            'whatsapp' &&
+                        platform !==
+                            'signal'
                     ) {
                         client.emit(
                             'error-message',
@@ -907,7 +1398,9 @@ io.on(
                         return;
                     }
 
-                    if (!phoneNumber) {
+                    if (
+                        !phoneNumber
+                    ) {
                         client.emit(
                             'error-message',
                             'Phone number is required',
@@ -916,12 +1409,18 @@ io.on(
                         return;
                     }
 
+                    /**
+                     * Persist FIRST.
+                     */
                     await saveTrackedContact(
                         id,
                         platform,
                         phoneNumber,
                     );
 
+                    /**
+                     * Send updated contact list.
+                     */
                     const contacts =
                         await getTrackedContacts();
 
@@ -931,46 +1430,26 @@ io.on(
                     );
 
                     /**
-                     * If WhatsApp is currently connected,
-                     * start the tracker immediately.
+                     * If WhatsApp is already connected,
+                     * start immediately.
                      */
                     if (
-                        platform === 'whatsapp' &&
+                        platform ===
+                            'whatsapp' &&
                         sock &&
                         whatsappConnectionOpen
                     ) {
-                        try {
-                            const tracker =
-                                createWhatsAppTracker(
-                                    sock,
-                                    phoneNumber,
-                                );
+                        const savedContact:
+                            TrackedContact =
+                            {
+                                id,
+                                platform,
+                                phoneNumber,
+                            };
 
-                            if (
-                                tracker &&
-                                typeof (tracker as any).start ===
-                                    'function'
-                            ) {
-                                await (tracker as any).start();
-                            } else if (
-                                tracker &&
-                                typeof (tracker as any)
-                                    .startTracking ===
-                                    'function'
-                            ) {
-                                await (tracker as any)
-                                    .startTracking();
-                            }
-
-                            console.log(
-                                `[WA] Started tracker for ${phoneNumber}`,
-                            );
-                        } catch (err) {
-                            console.error(
-                                `[WA] Failed to start tracker for ${phoneNumber}:`,
-                                err,
-                            );
-                        }
+                        await startWhatsAppTracker(
+                            savedContact,
+                        );
                     }
                 } catch (err) {
                     console.error(
@@ -981,23 +1460,50 @@ io.on(
             },
         );
 
-        /* --------------------------------------------------------
+
+        /* ========================================================
            REMOVE CONTACT
-        -------------------------------------------------------- */
+        ======================================================== */
 
         client.on(
             'remove-contact',
-            async (data: any) => {
+            async (
+                data: any,
+            ) => {
                 try {
                     const id =
                         String(
-                            data?.id ?? '',
+                            data?.id ??
+                                '',
                         ).trim();
 
                     if (!id) {
                         return;
                     }
 
+                    /**
+                     * Stop active tracker first.
+                     */
+                    const tracker =
+                        whatsappTrackers.get(
+                            id,
+                        );
+
+                    if (tracker) {
+                        try {
+                            tracker.stopTracking();
+                        } catch {
+                            // Ignore.
+                        }
+
+                        whatsappTrackers.delete(
+                            id,
+                        );
+                    }
+
+                    /**
+                     * Delete persistent contact.
+                     */
                     await removeTrackedContact(
                         id,
                     );
@@ -1018,22 +1524,27 @@ io.on(
             },
         );
 
-        /* --------------------------------------------------------
+
+        /* ========================================================
            GET MEASUREMENT HISTORY
-        -------------------------------------------------------- */
+        ======================================================== */
 
         client.on(
             'get-measurement-history',
-            async (data: any) => {
+            async (
+                data: any,
+            ) => {
                 try {
                     const deviceId =
                         String(
-                            data?.deviceId ?? '',
+                            data?.deviceId ??
+                                '',
                         ).trim();
 
                     const limit =
                         Number(
-                            data?.limit ?? 500,
+                            data?.limit ??
+                                500,
                         );
 
                     if (!deviceId) {
@@ -1062,9 +1573,10 @@ io.on(
             },
         );
 
-        /* --------------------------------------------------------
+
+        /* ========================================================
            DISCONNECT
-        -------------------------------------------------------- */
+        ======================================================== */
 
         client.on(
             'disconnect',
@@ -1077,46 +1589,9 @@ io.on(
     },
 );
 
-/* ============================================================
-   TRACKER MEASUREMENT EVENT HANDLER
-   ============================================================ */
-
-/**
- * This function is intentionally generic so your existing tracker
- * can call it with the measurement object.
- */
-function onTrackerMeasurement(
-    measurement: Measurement,
-) {
-    /**
-     * Broadcast immediately.
-     */
-    io.emit(
-        'measurement',
-        measurement,
-    );
-
-    /**
-     * Persist permanently.
-     */
-    void saveMeasurement(
-        measurement,
-    );
-}
 
 /* ============================================================
-   OPTIONAL GLOBAL TRACKER HOOK
-   ============================================================ */
-
-/**
- * Make the measurement handler available globally so tracker
- * implementations that expect a global callback can use it.
- */
-(globalThis as any).onTrackerMeasurement =
-    onTrackerMeasurement;
-
-/* ============================================================
-   START SERVER
+   SERVER START
    ============================================================ */
 
 server.listen(
@@ -1127,6 +1602,9 @@ server.listen(
             `[SERVER] Listening on port ${PORT}`,
         );
 
+        /**
+         * Check PostgreSQL.
+         */
         if (pool) {
             try {
                 await pool.query(
@@ -1145,19 +1623,20 @@ server.listen(
         }
 
         /**
-         * Restore Signal contacts independently.
+         * Restore saved Signal contacts.
          */
         void restoreSignalTrackers();
 
         /**
-         * Start exactly one WhatsApp connection.
+         * Start exactly ONE WhatsApp connection.
          */
         void connectToWhatsApp();
     },
 );
 
+
 /* ============================================================
-   PROCESS SHUTDOWN
+   SHUTDOWN
    ============================================================ */
 
 async function shutdown(
@@ -1167,67 +1646,111 @@ async function shutdown(
         `[SERVER] Received ${signal}, shutting down...`,
     );
 
+    /**
+     * Never reconnect while shutting down.
+     */
     clearWhatsAppReconnectTimer();
 
     /**
-     * Invalidate the socket so no stale connection.update event
-     * can schedule another connection during shutdown.
+     * Invalidate every existing WhatsApp event listener.
      */
     whatsappGeneration++;
 
-    whatsappConnecting = false;
+    whatsappConnecting =
+        false;
 
-    whatsappConnectionOpen = false;
+    whatsappConnectionOpen =
+        false;
 
-    const currentSocket = sock;
+    /**
+     * Stop trackers.
+     */
+    for (
+        const tracker
+        of whatsappTrackers.values()
+    ) {
+        try {
+            tracker.stopTracking();
+        } catch {
+            // Ignore.
+        }
+    }
+
+    whatsappTrackers.clear();
+
+    /**
+     * Detach global socket.
+     */
+    const currentSocket =
+        sock;
 
     sock = null;
 
-    try {
-        if (currentSocket) {
-            try {
-                currentSocket.end(
-                    undefined,
-                );
-            } catch {
-                // Ignore socket shutdown errors.
-            }
+    currentWhatsAppQr =
+        null;
+
+    /**
+     * Close Baileys socket.
+     */
+    if (currentSocket) {
+        try {
+            currentSocket.end(
+                undefined,
+            );
+        } catch {
+            // Ignore.
         }
-    } catch {
-        // Ignore.
     }
 
-    try {
-        await pool?.end();
-    } catch (err) {
-        console.error(
-            '[DB] Error closing PostgreSQL pool:',
-            err,
-        );
+    /**
+     * Close database.
+     */
+    if (pool) {
+        try {
+            await pool.end();
+        } catch (err) {
+            console.error(
+                '[DB] Error closing PostgreSQL:',
+                err,
+            );
+        }
     }
 
+    /**
+     * Close HTTP server.
+     */
     server.close(
         () => {
             process.exit(0);
         },
     );
 
+    /**
+     * Don't hang forever.
+     */
     setTimeout(
-        () => process.exit(0),
+        () => {
+            process.exit(0);
+        },
         5000,
     );
 }
 
+
 process.on(
     'SIGTERM',
     () => {
-        void shutdown('SIGTERM');
+        void shutdown(
+            'SIGTERM',
+        );
     },
 );
 
 process.on(
     'SIGINT',
     () => {
-        void shutdown('SIGINT');
+        void shutdown(
+            'SIGINT',
+        );
     },
 );
