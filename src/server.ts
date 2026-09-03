@@ -233,6 +233,24 @@ async function pollSignalLinkingStatus() {
 checkSignalConnection();
 setInterval(checkSignalConnection, 5000);
 
+
+// Add this block right BEFORE io.on('connection', ...) to let the frontend connect:
+io.use((socket, next) => {
+    const authHeader = socket.handshake.headers.authorization;
+    if (!authHeader) {
+        return next(new Error('Authentication error'));
+    }
+    const token = authHeader.split(' ')[1];
+    const decoded = Buffer.from(token, 'base64').toString('utf8');
+    const [username, password] = decoded.split(':');
+    
+    const expectedPassword = process.env.DASHBOARD_PASSWORD || 'fallback_temporary_password';
+    if (username === 'admin' && password === expectedPassword) {
+        return next();
+    }
+    return next(new Error('Authentication error'));
+});
+
 // Establish WebSocket listeners
 io.on('connection', (socket) => {
     console.log('Client connected');
