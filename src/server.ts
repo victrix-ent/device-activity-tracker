@@ -63,7 +63,7 @@ const __dirname = path.dirname(__filename);
  */
 const clientDistPath = path.resolve(
     __dirname,
-    '../client/dist',
+    '../client/build',
 );
 
 console.log(
