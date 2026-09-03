@@ -274,7 +274,7 @@ io.on('connection', (socket) => {
 });
 
 // Fallback directory path configuration for React Single Page Application routing
-app.get('/*path', (req, res) => {
+app.get('/{*path}', (req, res) => {
     res.sendFile(path.join(clientPath, 'index.html'));
 });
 
