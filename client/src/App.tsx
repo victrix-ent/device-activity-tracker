@@ -6,10 +6,21 @@ import { Dashboard } from './components/Dashboard';
 // Create socket with autoConnect disabled so we can add listeners before connecting
 const API_URL = 'https://at-b3fr.onrender.com';
 
+// Base64 encodes your credentials from the browser window dynamically
+const getAuthHeader = () => {
+    try {
+        return 'Basic ' + btoa('admin:' + (process.env.REACT_APP_DASHBOARD_PASSWORD || ''));
+    } catch (e) {
+        return '';
+    }
+};
 
-export const socket: Socket = io(API_URL, { 
-    transports: ['websocket', 'polling'], 
-    autoConnect: true 
+export const socket: Socket = io('https://at-b3fr.onrender.com', { 
+    transports: ['websocket', 'polling'],
+    autoConnect: true,
+    extraHeaders: {
+        Authorization: getAuthHeader()
+    }
 });
 
 
