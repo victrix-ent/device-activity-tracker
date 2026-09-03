@@ -256,17 +256,134 @@ io.use((socket, next) => {
 io.on('connection', (socket) => {
     console.log('Client connected');
 
-    if (currentWhatsAppQr) {
-        socket.emit('qr', currentWhatsAppQr);
-    }
-
-    if (isWhatsAppConnected) {
-        socket.emit('connection-open');
-    }
-
-    if (isSignalConnected) {
+    if (currentWhatsAppQr) socket.emit('qr', currentWhatsAppQr);
+    if (isWhatsAppConnected) socket.emit('connection-open');
+    if (isSignalConnected && signalAccountNumber) {
         socket.emit('signal-connection-open', { number: signalAccountNumber });
     }
+    socket.emit('signal-api-status', { available: signalApiAvailable });
+    if (signalLinkingInProgress && currentSignalQrUrl) {
+        socket.emit('signal-qr-image', currentSignalQrUrl);
+    }
+    socket.emit('probe-method', globalProbeMethod);
+
+    socket.on('get-tracked-contacts', () => {
+        socket.emit('tracked-contacts', Array.from(trackers.entries()).map(([id, entry]) => ({
+            id,
+            platform: entry.platform
+        })));
+    });
+
+    socket.on('add-contact', async (data: string | { number: string; platform: Platform }) => {
+        const { number, platform } = typeof data === 'string'
+            ? { number: data, platform: 'whatsapp' as Platform }
+            : data;
+        const cleanNumber = number.replace(/\D/g, '');
+
+        if (platform === 'signal') {
+            if (!isSignalConnected || !signalAccountNumber) {
+                socket.emit('error', { message: 'Signal is not connected. Please link Signal first.' });
+                return;
+            }
+
+            const signalId = `signal:${cleanNumber}`;
+            if (trackers.has(signalId)) {
+                socket.emit('error', { jid: signalId, message: 'Already tracking this contact on Signal' });
+                return;
+            }
+
+            try {
+                const targetNumber = `+${cleanNumber}`;
+                const checkResult = await checkSignalNumber(SIGNAL_API_URL, signalAccountNumber, targetNumber);
+                if (!checkResult.registered) {
+                    socket.emit('error', {
+                        jid: signalId,
+                        message: checkResult.error || 'Number is not discoverable on Signal'
+                    });
+                    return;
+                }
+
+                const tracker = new SignalTracker(SIGNAL_API_URL, signalAccountNumber, targetNumber);
+                trackers.set(signalId, { tracker, platform: 'signal' });
+                tracker.onUpdate = (updateData) => io.emit('tracker-update', {
+                    jid: signalId,
+                    platform: 'signal',
+                    ...updateData
+                });
+                tracker.startTracking();
+                socket.emit('contact-added', { jid: signalId, number: cleanNumber, platform: 'signal' });
+                io.emit('contact-name', { jid: signalId, name: cleanNumber });
+            } catch (err) {
+                console.error(err);
+                socket.emit('error', { message: 'Failed to start Signal tracking' });
+            }
+            return;
+        }
+
+        const targetJid = `${cleanNumber}@s.whatsapp.net`;
+        if (trackers.has(targetJid)) {
+            socket.emit('error', { jid: targetJid, message: 'Already tracking this contact' });
+            return;
+        }
+
+        try {
+            const results = await sock.onWhatsApp(targetJid);
+            const result = results?.[0];
+            if (!result?.exists) {
+                socket.emit('error', { jid: targetJid, message: 'Number not on WhatsApp' });
+                return;
+            }
+
+            const tracker = new WhatsAppTracker(sock, result.jid);
+            tracker.setProbeMethod(globalProbeMethod);
+            trackers.set(result.jid, { tracker, platform: 'whatsapp' });
+            tracker.onUpdate = (updateData) => io.emit('tracker-update', {
+                jid: result.jid,
+                platform: 'whatsapp',
+                ...updateData
+            });
+            tracker.startTracking();
+
+            const ppUrl = await tracker.getProfilePicture();
+            let contactName = cleanNumber;
+            try {
+                const contactInfo = await sock.onWhatsApp(result.jid);
+                if (contactInfo?.[0]?.notify) contactName = contactInfo[0].notify;
+            } catch {
+                console.log('[NAME] Could not fetch contact name, using number');
+            }
+
+            socket.emit('contact-added', { jid: result.jid, number: cleanNumber, platform: 'whatsapp' });
+            io.emit('profile-pic', { jid: result.jid, url: ppUrl });
+            io.emit('contact-name', { jid: result.jid, name: contactName });
+        } catch (err) {
+            console.error(err);
+            socket.emit('error', { jid: targetJid, message: 'Verification failed' });
+        }
+    });
+
+    socket.on('remove-contact', (jid: string) => {
+        const entry = trackers.get(jid);
+        if (entry) {
+            entry.tracker.stopTracking();
+            trackers.delete(jid);
+            socket.emit('contact-removed', jid);
+        }
+    });
+
+    socket.on('set-probe-method', (method: ProbeMethod) => {
+        if (method !== 'delete' && method !== 'reaction') {
+            socket.emit('error', { message: 'Invalid probe method' });
+            return;
+        }
+        globalProbeMethod = method;
+        for (const entry of trackers.values()) {
+            if (entry.platform === 'whatsapp') {
+                (entry.tracker as WhatsAppTracker).setProbeMethod(method);
+            }
+        }
+        io.emit('probe-method', method);
+    });
 
     socket.on('disconnect', () => {
         console.log('Client disconnected');
