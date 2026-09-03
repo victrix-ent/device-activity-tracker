@@ -93,39 +93,18 @@ interface Measurement {
    WHATSAPP GLOBAL STATE
    ============================================================ */
 
-/**
- * There must only ever be ONE active WhatsApp socket.
- */
 let sock: ReturnType<typeof makeWASocket> | null = null;
 
-/**
- * Every socket gets a unique generation.
- *
- * If an old socket fires an event after a new socket has been
- * created, that event is ignored.
- */
 let whatsappGeneration = 0;
 
-/**
- * True while a socket is being established.
- */
 let whatsappConnecting = false;
 
-/**
- * True only after Baileys reports connection === "open".
- */
 let whatsappConnectionOpen = false;
 
-/**
- * Only one reconnect timer may exist.
- */
 let whatsappReconnectTimer: NodeJS.Timeout | null = null;
 
 let currentWhatsAppQr: string | null = null;
 
-/**
- * Prevent restoring the same trackers multiple times.
- */
 let whatsappRestoreInProgress = false;
 
 
@@ -133,11 +112,6 @@ let whatsappRestoreInProgress = false;
    TRACKER STORAGE
    ============================================================ */
 
-/**
- * Keep references to active trackers.
- *
- * The key is the database contact ID.
- */
 const whatsappTrackers =
     new Map<string, WhatsAppTracker>();
 
@@ -435,22 +409,6 @@ function handleTrackerUpdate(
     contact: TrackedContact,
     data: any,
 ) {
-    /**
-     * The tracker sends:
-     *
-     * {
-     *   devices,
-     *   deviceCount,
-     *   presence,
-     *   median,
-     *   threshold
-     * }
-     *
-     * Each device can have its own RTT/state.
-     *
-     * Persist the primary target/device data.
-     */
-
     const devices =
         Array.isArray(data?.devices)
             ? data.devices
@@ -509,9 +467,6 @@ function handleTrackerUpdate(
         );
     }
 
-    /**
-     * Send the complete tracker update to the frontend.
-     */
     io.emit(
         'tracker-update',
         {
@@ -522,10 +477,6 @@ function handleTrackerUpdate(
         },
     );
 
-    /**
-     * Also emit the measurement event used by the existing
-     * dashboard if it listens for "measurement".
-     */
     if (devices.length > 0) {
         for (const device of devices) {
             io.emit(
@@ -589,9 +540,6 @@ async function startWhatsAppTracker(
         return;
     }
 
-    /**
-     * Do not create duplicate trackers for the same contact.
-     */
     if (
         whatsappTrackers.has(
             contact.id,
@@ -658,9 +606,6 @@ async function restoreWhatsAppTrackers(
         return;
     }
 
-    /**
-     * Make absolutely sure this is still the active socket.
-     */
     if (
         socket !== sock ||
         generation !== whatsappGeneration
@@ -697,9 +642,6 @@ async function restoreWhatsAppTrackers(
             const contact
             of whatsappContacts
         ) {
-            /**
-             * Socket may disconnect while restoring contacts.
-             */
             if (
                 socket !== sock ||
                 generation !== whatsappGeneration ||
@@ -761,12 +703,6 @@ async function restoreSignalTrackers() {
             `[RESTORE] Found ${signalContacts.length} saved Signal tracker(s)`,
         );
 
-        /**
-         * Keep the saved Signal contacts available.
-         *
-         * The actual Signal tracker implementation can be
-         * restored here when its runtime/API is available.
-         */
         for (
             const contact
             of signalContacts
@@ -805,9 +741,6 @@ function clearWhatsAppReconnectTimer() {
 
 
 function scheduleWhatsAppReconnect() {
-    /**
-     * Never create multiple reconnect timers.
-     */
     if (
         whatsappReconnectTimer
     ) {
@@ -835,19 +768,10 @@ function scheduleWhatsAppReconnect() {
 }
 
 
-/**
- * Completely invalidate the current socket.
- *
- * This is the key part of the duplicate-connection fix.
- */
 function invalidateWhatsAppSocket(
     socketToInvalidate?:
         ReturnType<typeof makeWASocket>,
 ) {
-    /**
-     * If a stale socket tries to invalidate the current socket,
-     * ignore it.
-     */
     if (
         socketToInvalidate &&
         sock &&
@@ -856,11 +780,6 @@ function invalidateWhatsAppSocket(
         return;
     }
 
-    /**
-     * Increment generation FIRST.
-     *
-     * Any events emitted after this point become stale.
-     */
     whatsappGeneration++;
 
     sock = null;
@@ -890,11 +809,6 @@ async function connectToWhatsApp() {
         return;
     }
 
-    /**
-     * HARD LOCK:
-     *
-     * Don't create another socket while one is being created.
-     */
     if (whatsappConnecting) {
         console.log(
             '[WA] Connection attempt already in progress — skipping',
@@ -903,11 +817,6 @@ async function connectToWhatsApp() {
         return;
     }
 
-    /**
-     * HARD LOCK:
-     *
-     * Don't create another socket while one is already open.
-     */
     if (
         sock &&
         whatsappConnectionOpen
@@ -919,10 +828,6 @@ async function connectToWhatsApp() {
         return;
     }
 
-    /**
-     * Also don't create another socket if one exists and is still
-     * connecting.
-     */
     if (
         sock &&
         !whatsappConnectionOpen
@@ -937,9 +842,6 @@ async function connectToWhatsApp() {
     whatsappConnecting =
         true;
 
-    /**
-     * Each socket receives its own generation.
-     */
     const generation =
         ++whatsappGeneration;
 
@@ -950,9 +852,6 @@ async function connectToWhatsApp() {
     try {
         clearWhatsAppReconnectTimer();
 
-        /**
-         * Load persistent credentials from PostgreSQL.
-         */
         const {
             state,
             saveCreds,
@@ -962,10 +861,6 @@ async function connectToWhatsApp() {
                 'whatsapp-main',
             );
 
-        /**
-         * Make sure another connection wasn't created while
-         * PostgreSQL was loading.
-         */
         if (
             generation !==
             whatsappGeneration
@@ -991,9 +886,6 @@ async function connectToWhatsApp() {
             return;
         }
 
-        /**
-         * Create exactly ONE Baileys socket.
-         */
         const newSock =
             makeWASocket({
                 auth: state,
@@ -1010,9 +902,6 @@ async function connectToWhatsApp() {
                     false,
             });
 
-        /**
-         * Assign it immediately.
-         */
         sock =
             newSock;
 
@@ -1020,9 +909,6 @@ async function connectToWhatsApp() {
             `[WA] Socket created — generation ${generation}`,
         );
 
-        /**
-         * Save every credential change to PostgreSQL.
-         */
         newSock.ev.on(
             'creds.update',
             async () => {
@@ -1037,9 +923,10 @@ async function connectToWhatsApp() {
             },
         );
 
+
         /* ========================================================
            CONNECTION UPDATE
-        ======================================================== */
+           ======================================================== */
 
         newSock.ev.on(
             'connection.update',
@@ -1052,23 +939,6 @@ async function connectToWhatsApp() {
                     qr,
                 } = update;
 
-                /**
-                 * CRITICAL GENERATION CHECK.
-                 *
-                 * If this isn't the current socket, ignore it.
-                 *
-                 * This prevents:
-                 *
-                 * OLD SOCKET
-                 *      ↓
-                 * connection.close
-                 *      ↓
-                 * reconnect
-                 *      ↓
-                 * NEW SOCKET
-                 *
-                 * from being triggered repeatedly.
-                 */
                 if (
                     newSock !== sock ||
                     generation !==
@@ -1080,6 +950,7 @@ async function connectToWhatsApp() {
 
                     return;
                 }
+
 
                 /* ------------------------------------------------
                    QR
@@ -1098,6 +969,7 @@ async function connectToWhatsApp() {
                         '[WA] QR code received',
                     );
                 }
+
 
                 /* ------------------------------------------------
                    CONNECTING
@@ -1120,6 +992,7 @@ async function connectToWhatsApp() {
                     );
                 }
 
+
                 /* ------------------------------------------------
                    OPEN
                 ------------------------------------------------ */
@@ -1128,10 +1001,6 @@ async function connectToWhatsApp() {
                     connection ===
                     'open'
                 ) {
-                    /**
-                     * Make sure this socket is STILL the current
-                     * socket before changing global state.
-                     */
                     if (
                         newSock !== sock ||
                         generation !==
@@ -1162,15 +1031,33 @@ async function connectToWhatsApp() {
                         'open',
                     );
 
-                    /**
-                     * Restore the persistent trackers only after
-                     * the socket is actually open.
-                     */
-                    await restoreWhatsAppTrackers(
-                        newSock,
-                        generation,
+                    /* =================================================
+                       TEST MODE
+
+                       DO NOT RESTORE/START ANY WHATSAPP TRACKERS.
+
+                       This is intentionally disabled so we can determine
+                       whether WhatsApp stays connected without the
+                       WhatsAppTracker running.
+
+                       If the connection remains open, the tracker is
+                       responsible for the 440 disconnect.
+
+                       If it still closes with 440, the tracker is not
+                       responsible and we investigate another session or
+                       connection using the same WhatsApp credentials.
+                       ================================================= */
+
+                    console.log(
+                        '[TEST] WhatsApp tracker restoration DISABLED',
                     );
+
+                    // await restoreWhatsAppTrackers(
+                    //     newSock,
+                    //     generation,
+                    // );
                 }
+
 
                 /* ------------------------------------------------
                    CLOSE
@@ -1180,9 +1067,6 @@ async function connectToWhatsApp() {
                     connection ===
                     'close'
                 ) {
-                    /**
-                     * Ignore close events from stale sockets.
-                     */
                     if (
                         newSock !== sock ||
                         generation !==
@@ -1214,9 +1098,6 @@ async function connectToWhatsApp() {
                         `[WA] Connection closed — statusCode=${statusCode}, reconnect=${shouldReconnect}, generation=${generation}`,
                     );
 
-                    /**
-                     * STOP all trackers belonging to this socket.
-                     */
                     for (
                         const tracker
                         of whatsappTrackers.values()
@@ -1230,14 +1111,6 @@ async function connectToWhatsApp() {
 
                     whatsappTrackers.clear();
 
-                    /**
-                     * IMPORTANT:
-                     *
-                     * Invalidate BEFORE scheduling reconnect.
-                     *
-                     * This makes every subsequent event from this
-                     * socket stale.
-                     */
                     invalidateWhatsAppSocket(
                         newSock,
                     );
@@ -1277,9 +1150,6 @@ async function connectToWhatsApp() {
             err,
         );
 
-        /**
-         * Only invalidate if this is still the active generation.
-         */
         if (
             generation ===
             whatsappGeneration
@@ -1306,9 +1176,6 @@ io.on(
             `[SOCKET] Client connected: ${client.id}`,
         );
 
-        /**
-         * Immediately tell the frontend the current state.
-         */
         client.emit(
             'connection-state',
             whatsappConnectionOpen
@@ -1316,9 +1183,6 @@ io.on(
                 : 'closed',
         );
 
-        /**
-         * Send current QR if one exists.
-         */
         if (
             currentWhatsAppQr
         ) {
@@ -1409,18 +1273,12 @@ io.on(
                         return;
                     }
 
-                    /**
-                     * Persist FIRST.
-                     */
                     await saveTrackedContact(
                         id,
                         platform,
                         phoneNumber,
                     );
 
-                    /**
-                     * Send updated contact list.
-                     */
                     const contacts =
                         await getTrackedContacts();
 
@@ -1429,10 +1287,6 @@ io.on(
                         contacts,
                     );
 
-                    /**
-                     * If WhatsApp is already connected,
-                     * start immediately.
-                     */
                     if (
                         platform ===
                             'whatsapp' &&
@@ -1481,9 +1335,6 @@ io.on(
                         return;
                     }
 
-                    /**
-                     * Stop active tracker first.
-                     */
                     const tracker =
                         whatsappTrackers.get(
                             id,
@@ -1501,9 +1352,6 @@ io.on(
                         );
                     }
 
-                    /**
-                     * Delete persistent contact.
-                     */
                     await removeTrackedContact(
                         id,
                     );
@@ -1602,9 +1450,6 @@ server.listen(
             `[SERVER] Listening on port ${PORT}`,
         );
 
-        /**
-         * Check PostgreSQL.
-         */
         if (pool) {
             try {
                 await pool.query(
@@ -1622,14 +1467,8 @@ server.listen(
             }
         }
 
-        /**
-         * Restore saved Signal contacts.
-         */
         void restoreSignalTrackers();
 
-        /**
-         * Start exactly ONE WhatsApp connection.
-         */
         void connectToWhatsApp();
     },
 );
@@ -1646,14 +1485,8 @@ async function shutdown(
         `[SERVER] Received ${signal}, shutting down...`,
     );
 
-    /**
-     * Never reconnect while shutting down.
-     */
     clearWhatsAppReconnectTimer();
 
-    /**
-     * Invalidate every existing WhatsApp event listener.
-     */
     whatsappGeneration++;
 
     whatsappConnecting =
@@ -1662,9 +1495,6 @@ async function shutdown(
     whatsappConnectionOpen =
         false;
 
-    /**
-     * Stop trackers.
-     */
     for (
         const tracker
         of whatsappTrackers.values()
@@ -1678,9 +1508,6 @@ async function shutdown(
 
     whatsappTrackers.clear();
 
-    /**
-     * Detach global socket.
-     */
     const currentSocket =
         sock;
 
@@ -1689,9 +1516,6 @@ async function shutdown(
     currentWhatsAppQr =
         null;
 
-    /**
-     * Close Baileys socket.
-     */
     if (currentSocket) {
         try {
             currentSocket.end(
@@ -1702,9 +1526,6 @@ async function shutdown(
         }
     }
 
-    /**
-     * Close database.
-     */
     if (pool) {
         try {
             await pool.end();
@@ -1716,18 +1537,12 @@ async function shutdown(
         }
     }
 
-    /**
-     * Close HTTP server.
-     */
     server.close(
         () => {
             process.exit(0);
         },
     );
 
-    /**
-     * Don't hang forever.
-     */
     setTimeout(
         () => {
             process.exit(0);
