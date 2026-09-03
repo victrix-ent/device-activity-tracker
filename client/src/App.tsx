@@ -6,20 +6,21 @@ import { Dashboard } from './components/Dashboard';
 // Create socket with autoConnect disabled so we can add listeners before connecting
 const API_URL = 'https://at-b3fr.onrender.com';
 
-// Base64 encodes your credentials from the browser window dynamically
-const getAuthHeader = () => {
-    try {
-        return 'Basic ' + btoa('admin:' + (process.env.REACT_APP_DASHBOARD_PASSWORD || ''));
-    } catch (e) {
-        return '';
+/// Checks if the device is already authorized, otherwise prompts for the password once
+let savedPassword = localStorage.getItem('tracker_password');
+if (!savedPassword) {
+    const userInput = prompt('Enter your dashboard security password:');
+    if (userInput) {
+        localStorage.setItem('tracker_password', userInput);
+        savedPassword = userInput;
     }
-};
+}
 
-export const socket: Socket = io('https://at-b3fr.onrender.com', { 
+export const socket: Socket = io('https://onrender.com', { 
     transports: ['websocket', 'polling'],
     autoConnect: true,
     extraHeaders: {
-        Authorization: getAuthHeader()
+        Authorization: 'Basic ' + btoa('admin:' + (savedPassword || ''))
     }
 });
 
